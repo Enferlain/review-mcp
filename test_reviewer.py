@@ -38,6 +38,34 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertGreater(len(args), 3)
         self.assertTrue(all(part.startswith(":!") for part in args[3:]))
 
+    def test_get_changed_files_handles_missing_git(self) -> None:
+        with mock.patch("reviewer._run_git_command", side_effect=FileNotFoundError):
+            result = reviewer.get_changed_files(".")
+
+        self.assertEqual(result, [])
+
+    def test_read_context_files_accepts_none_and_single_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            context_file = Path(tmpdir) / "context.md"
+            context_file.write_text("context body", encoding="utf-8")
+
+            self.assertEqual(reviewer.read_context_files(None, tmpdir), "")
+            self.assertEqual(reviewer.read_context_files(["", "   "], tmpdir), "")
+            result = reviewer.read_context_files(str(context_file), tmpdir)
+
+        self.assertIn("context body", result)
+
+    def test_read_context_file_with_links_reports_read_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            context_file = Path(tmpdir) / "context.md"
+            context_file.write_text("context body", encoding="utf-8")
+
+            with mock.patch.object(Path, "read_text", side_effect=UnicodeDecodeError("utf-8", b"", 0, 1, "bad")):
+                content, diff_files = reviewer.read_context_file_with_links(context_file, tmpdir)
+
+        self.assertIn("Error reading context file", content)
+        self.assertEqual(diff_files, [])
+
     def test_max_review_iterations_is_capped(self) -> None:
         with mock.patch.dict(os.environ, {"MAX_REVIEW_ITERATIONS": "500"}, clear=False):
             self.assertEqual(reviewer._get_max_iterations(), reviewer.MAX_ALLOWED_ITERATIONS)
@@ -96,6 +124,56 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
                 result = reviewer.run_agentic_review(working_dir=tmpdir)
 
         self.assertEqual(result, "structured review")
+
+    def test_object_final_response_content_is_supported(self) -> None:
+        class TextPart:
+            text = "object review"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_client = mock.Mock()
+            fake_message = mock.Mock()
+            fake_message.tool_calls = None
+            fake_message.content = [TextPart()]
+            fake_response = mock.Mock()
+            fake_response.choices = [mock.Mock(message=fake_message)]
+            fake_client.chat.completions.create.return_value = fake_response
+
+            with mock.patch("reviewer._make_client", return_value=fake_client):
+                result = reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertEqual(result, "object review")
+
+    def test_model_can_be_overridden_by_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_client = mock.Mock()
+            fake_message = mock.Mock()
+            fake_message.tool_calls = None
+            fake_message.content = "synthetic review"
+            fake_response = mock.Mock()
+            fake_response.choices = [mock.Mock(message=fake_message)]
+            fake_client.chat.completions.create.return_value = fake_response
+
+            with mock.patch.dict(os.environ, {"AI_MODEL": "GLM-5.1"}, clear=False):
+                with mock.patch("reviewer._make_client", return_value=fake_client):
+                    reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertEqual(fake_client.chat.completions.create.call_args.kwargs["model"], "GLM-5.1")
+
+    def test_api_error_mentions_selected_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_client = mock.Mock()
+            fake_client.chat.completions.create.side_effect = RuntimeError("boom")
+
+            with mock.patch.dict(os.environ, {"AI_MODEL": "GLM-5.1"}, clear=False):
+                with mock.patch("reviewer._make_client", return_value=fake_client):
+                    result = reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertIn("Error calling model 'GLM-5.1' API", result)
+
+    def test_non_dict_tool_arguments_are_ignored(self) -> None:
+        result = reviewer._execute_tool("read_files", ["not", "a", "dict"], working_dir=".")
+
+        self.assertEqual(result, "")
 
     def test_openspec_change_directory_expands_to_context_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
