@@ -211,12 +211,17 @@ def get_changed_files(working_dir: str | Path) -> list[str]:
         unstaged = _run_git_command(working_dir, ["diff", "--name-only"])
         files = set(staged.stdout.strip().splitlines() + unstaged.stdout.strip().splitlines())
         return sorted(file for file in files if file)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         return []
 
 
-def read_context_files(filepaths: list[str], working_dir: str | Path) -> str:
+def read_context_files(filepaths: list[str] | str | None, working_dir: str | Path) -> str:
     """Read multiple context files and format them for the prompt."""
+    if not filepaths:
+        return ""
+    if isinstance(filepaths, str):
+        filepaths = [filepaths]
+
     context_chunks: list[str] = []
     for filepath in filepaths:
         resolved_paths = expand_context_entry(filepath, working_dir)
@@ -253,6 +258,8 @@ def read_context_file_with_links(
         content = resolved.read_text(encoding="utf-8")
     except FileNotFoundError:
         return f"(Context file not found: {resolved})", []
+    except Exception as exc:
+        return f"(Error reading context file '{resolved}': {exc})", []
 
     diff_files, read_files = parse_file_links(content)
 
@@ -365,6 +372,10 @@ def _message_content_to_text(content: object) -> str:
                 text = part.get("text")
                 if isinstance(text, str):
                     parts.append(text)
+            else:
+                text = getattr(part, "text", None)
+                if isinstance(text, str):
+                    parts.append(text)
         return "\n".join(parts)
     return str(content)
 
@@ -376,6 +387,9 @@ def _execute_tool(
     working_dir: str | Path,
 ) -> str:
     """Execute a model tool and return its result as a string."""
+    if not isinstance(arguments, dict):
+        arguments = {}
+
     if name == "get_uncommitted_changes":
         return get_git_diff(working_dir, arguments.get("target", "staged"))
     if name == "read_files":
@@ -606,7 +620,7 @@ Be concise but thorough. Ignore minor style issues."""
         for retry in range(3):
             try:
                 response = client.chat.completions.create(
-                    model="GLM-4.7",
+                    model=os.getenv("AI_MODEL") or os.getenv("ZHIPU_MODEL") or "GLM-4.7",
                     messages=messages,
                     tools=REVIEWER_TOOLS,
                     tool_choice="auto",
@@ -670,6 +684,13 @@ Be concise but thorough. Ignore minor style issues."""
             func_name = tool_call.function.name
             try:
                 func_args = json.loads(tool_call.function.arguments)
+                if not isinstance(func_args, dict):
+                    logger.warning(
+                        "Invalid argument type for %s: %s",
+                        func_name,
+                        type(func_args).__name__,
+                    )
+                    func_args = {}
             except json.JSONDecodeError:
                 logger.warning(
                     "Invalid JSON arguments for %s: %r",

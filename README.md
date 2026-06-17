@@ -70,6 +70,7 @@ Environment variables (in `.env`):
 - `AI_API_KEY` (required): Your API key
 - `ZHIPU_API_KEY` (optional): Backward-compatible fallback key name
 - `ZHIPU_BASE_URL` (optional): Override API endpoint
+- `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `GLM-4.7`)
 - `MAX_REVIEW_ITERATIONS` (optional): Max tool-calling iterations (default: 20, capped at 50)
 - `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
 
