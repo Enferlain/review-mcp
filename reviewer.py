@@ -1,32 +1,34 @@
 """
-Code review logic using Zhipu GLM-4.7 via OpenAI-compatible API.
+Code review logic using Zhipu GLM via an OpenAI-compatible API.
 """
 
+from __future__ import annotations
+
+import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from urllib.parse import unquote
 
-from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# Configure logging to write to stderr (keeps stdout clean for MCP protocol)
 logging.basicConfig(
-    level=logging.INFO, format="[%(name)s] %(message)s", stream=sys.stderr
+    level=logging.INFO,
+    format="[%(name)s] %(message)s",
+    stream=sys.stderr,
 )
-# Silence verbose 3rd party loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger("ReviewMCP")
 
-# File patterns to exclude from diffs (lockfiles, binaries, etc.)
 EXCLUDE_PATTERNS = [
     "*.lock",
     "*.json",
@@ -41,323 +43,332 @@ EXCLUDE_PATTERNS = [
     "pnpm-lock.yaml",
 ]
 
+MAX_ALLOWED_ITERATIONS = 50
+MAX_CONTEXT_FILES_PER_DIRECTORY = 50
+CONTEXT_DIRECTORY_SUFFIXES = {".md", ".txt", ".yaml", ".yml", ".json"}
+OPENSPEC_ROOT_FILE_ORDER = {
+    "proposal.md": 0,
+    "design.md": 1,
+    "tasks.md": 2,
+}
 
-def get_git_diff(target: str = "staged") -> str:
-    """
-    Get git diff output.
 
-    Args:
-        target: 'staged' for staged changes, 'unstaged' for working tree,
-                or a git ref like 'HEAD~1' for comparing against a commit.
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment flag."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
-    Returns:
-        The diff output as a string.
-    """
+
+def _get_max_iterations() -> int:
+    """Return a safe iteration limit from the environment."""
+    raw_value = os.getenv("MAX_REVIEW_ITERATIONS", "20")
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid MAX_REVIEW_ITERATIONS=%r; defaulting to 20", raw_value)
+        return 20
+
+    if value < 1:
+        logger.warning("MAX_REVIEW_ITERATIONS must be >= 1; defaulting to 20")
+        return 20
+    if value > MAX_ALLOWED_ITERATIONS:
+        logger.warning(
+            "MAX_REVIEW_ITERATIONS=%s is too high; capping at %s",
+            value,
+            MAX_ALLOWED_ITERATIONS,
+        )
+        return MAX_ALLOWED_ITERATIONS
+    return value
+
+
+def _run_git_command(
+    working_dir: str | Path,
+    args: list[str],
+    *,
+    check: bool = True,
+    timeout: int = 30,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(working_dir),
+        capture_output=True,
+        text=True,
+        check=check,
+        encoding="utf-8",
+        stdin=subprocess.DEVNULL,
+        timeout=timeout,
+    )
+
+
+def _resolve_user_path(path: str | Path, working_dir: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return Path(working_dir) / candidate
+
+
+def _path_for_git(path: str | Path, working_dir: str | Path) -> str:
+    resolved = _resolve_user_path(path, working_dir)
+    try:
+        return resolved.relative_to(Path(working_dir)).as_posix()
+    except ValueError:
+        return resolved.as_posix()
+
+
+def _looks_like_openspec_change_dir(path: Path) -> bool:
+    """Detect an explicitly provided OpenSpec change directory."""
+    if not path.is_dir():
+        return False
+
+    has_openspec_layout = (path / "proposal.md").exists() or (path / "tasks.md").exists()
+    has_specs_dir = (path / "specs").is_dir()
+    return has_openspec_layout or has_specs_dir
+
+
+def _context_path_sort_key(path: Path, root: Path) -> tuple[int, str]:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+
+    if len(relative.parts) == 1:
+        priority = OPENSPEC_ROOT_FILE_ORDER.get(relative.name, 10)
+    elif relative.parts[0] == "specs":
+        priority = 20
+    else:
+        priority = 30
+    return priority, relative.as_posix()
+
+
+def expand_context_entry(path: str | Path, working_dir: str | Path) -> list[Path]:
+    """Expand a context file entry into one or more readable context files."""
+    resolved = _resolve_user_path(path, working_dir)
+    if resolved.is_file():
+        return [resolved]
+    if not resolved.is_dir():
+        return []
+    if not _looks_like_openspec_change_dir(resolved):
+        return []
+
+    files = [
+        candidate
+        for candidate in resolved.rglob("*")
+        if candidate.is_file()
+        and not any(part.startswith(".") for part in candidate.relative_to(resolved).parts)
+        and candidate.suffix.lower() in CONTEXT_DIRECTORY_SUFFIXES
+    ]
+    return sorted(files, key=lambda candidate: _context_path_sort_key(candidate, resolved))[
+        :MAX_CONTEXT_FILES_PER_DIRECTORY
+    ]
+
+
+def _make_client():
+    from openai import OpenAI
+
+    api_key = os.getenv("AI_API_KEY") or os.getenv("ZHIPU_API_KEY")
+    if not api_key:
+        raise ValueError(
+            "AI_API_KEY environment variable is not set. "
+            "ZHIPU_API_KEY is also accepted for backward compatibility."
+        )
+
+    base_url = os.getenv("ZHIPU_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
+    return OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        timeout=120.0,
+    )
+
+
+def get_git_diff(working_dir: str | Path, target: str = "staged") -> str:
+    """Get git diff output for the requested target."""
     try:
         if target == "staged":
-            args = ["git", "diff", "--staged"]
+            args = ["diff", "--staged"]
         elif target == "unstaged":
-            args = ["git", "diff"]
+            args = ["diff"]
         else:
-            # Assume it's a ref like HEAD~1
-            args = ["git", "diff", target]
+            args = ["diff", target]
 
-        # Add exclusion patterns
-        for pattern in EXCLUDE_PATTERNS:
-            args.extend(["--", f":!{pattern}"])
+        if EXCLUDE_PATTERNS:
+            args.append("--")
+            args.extend(f":!{pattern}" for pattern in EXCLUDE_PATTERNS)
 
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            check=True,
-            encoding="utf-8",
-            stdin=subprocess.DEVNULL,  # Prevent stealing MCP's stdin
-            timeout=30,
-        )
-        return result.stdout
-    except subprocess.CalledProcessError as e:
-        return f"Error running git diff: {e.stderr}"
+        return _run_git_command(working_dir, args).stdout
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        return f"Error running git diff: {stderr or exc}"
     except FileNotFoundError:
-        return "Error: git is not installed or not in PATH"
+        return "Error: git is not installed or not in PATH."
 
 
-def get_changed_files() -> list[str]:
-    """Get list of changed files (staged + unstaged)."""
+def get_changed_files(working_dir: str | Path) -> list[str]:
+    """Get the list of changed files (staged + unstaged)."""
     try:
-        # Get staged files
-        staged = subprocess.run(
-            ["git", "diff", "--staged", "--name-only"],
-            capture_output=True,
-            text=True,
-            check=True,
-            encoding="utf-8",
-            stdin=subprocess.DEVNULL,
-            timeout=30,
-        )
-        # Get unstaged files
-        unstaged = subprocess.run(
-            ["git", "diff", "--name-only"],
-            capture_output=True,
-            text=True,
-            check=True,
-            encoding="utf-8",
-            stdin=subprocess.DEVNULL,
-            timeout=30,
-        )
-        files = set(
-            staged.stdout.strip().split("\n") + unstaged.stdout.strip().split("\n")
-        )
-        return [f for f in files if f]  # Filter empty strings
+        staged = _run_git_command(working_dir, ["diff", "--staged", "--name-only"])
+        unstaged = _run_git_command(working_dir, ["diff", "--name-only"])
+        files = set(staged.stdout.strip().splitlines() + unstaged.stdout.strip().splitlines())
+        return sorted(file for file in files if file)
     except subprocess.CalledProcessError:
         return []
 
 
-def read_context_files(filepaths: list[str]) -> str:
-    """
-    Read multiple context files and format them for the prompt.
-
-    Args:
-        filepaths: List of file paths to read.
-
-    Returns:
-        Formatted string with file contents.
-    """
-    context = ""
+def read_context_files(filepaths: list[str], working_dir: str | Path) -> str:
+    """Read multiple context files and format them for the prompt."""
+    context_chunks: list[str] = []
     for filepath in filepaths:
-        try:
-            with open(filepath, "r", encoding="utf-8") as f:
-                content = f.read()
-                # Truncate very large files
+        resolved_paths = expand_context_entry(filepath, working_dir)
+        if not resolved_paths:
+            resolved = _resolve_user_path(filepath, working_dir)
+            context_chunks.append(f"\n\n(Note: Context file '{resolved}' not found or not readable)\n")
+            continue
+
+        if len(resolved_paths) > 1:
+            source = _resolve_user_path(filepath, working_dir)
+            context_chunks.append(f"\n\n--- CONTEXT DIRECTORY: {source} ---")
+
+        for resolved in resolved_paths:
+            try:
+                content = resolved.read_text(encoding="utf-8")
                 if len(content) > 50000:
                     content = content[:50000] + "\n\n... [TRUNCATED] ..."
-                context += f"\n\n--- FILE: {filepath} ---\n{content}"
-        except FileNotFoundError:
-            context += f"\n\n(Note: Context file '{filepath}' not found)\n"
-        except Exception as e:
-            context += f"\n\n(Error reading '{filepath}': {e})\n"
-    return context
+                context_chunks.append(f"\n\n--- FILE: {resolved} ---\n{content}")
+            except FileNotFoundError:
+                context_chunks.append(f"\n\n(Note: Context file '{resolved}' not found)\n")
+            except Exception as exc:
+                context_chunks.append(f"\n\n(Error reading '{resolved}': {exc})\n")
+    return "".join(context_chunks)
+
+
+def read_context_file_with_links(
+    filepath: str | Path,
+    working_dir: str | Path,
+    diff_target: str = "staged",
+) -> tuple[str, list[str]]:
+    """Read one context file and resolve render_diffs/file links."""
+    resolved = _resolve_user_path(filepath, working_dir)
+    try:
+        content = resolved.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return f"(Context file not found: {resolved})", []
+
+    diff_files, read_files = parse_file_links(content)
+
+    def replace_render_diff(match: re.Match[str]) -> str:
+        full_path = normalize_file_uri_path(unquote(match.group(1)))
+        file_diff = get_scoped_diff([full_path], working_dir, diff_target)
+        if file_diff:
+            return f"```diff\n{file_diff}\n```"
+        return f"(No changes in {full_path})"
+
+    processed = re.sub(
+        r"render_diffs\s*\(\s*file:///([^)]+)\s*\)",
+        replace_render_diff,
+        content,
+    )
+
+    linked_context = ""
+    for read_path in read_files[:5]:
+        try:
+            linked_file = _resolve_user_path(read_path, working_dir)
+            file_content = linked_file.read_text(encoding="utf-8")
+            if len(file_content) > 10000:
+                file_content = file_content[:10000] + "\n... [TRUNCATED]"
+            linked_context += f"\n\n--- LINKED FILE: {linked_file} ---\n{file_content}"
+        except Exception:
+            pass
+
+    return processed + linked_context, diff_files
 
 
 def normalize_file_uri_path(path: str) -> str:
-    """
-    Normalize a path extracted from a file:// URI.
-
-    Handles:
-    - Windows paths: file:///C:/foo -> C:/foo
-    - Unix paths: file:///foo -> /foo
-    - Already normalized paths
-    """
-    # Check for Windows drive letter (e.g., C:/)
+    """Normalize a path extracted from a file:// URI."""
     if len(path) > 1 and path[1] == ":":
         return path
-    # Unix path - ensure it starts with /
     if not path.startswith("/"):
         return "/" + path
     return path
 
 
 def parse_file_links(content: str) -> tuple[list[str], list[str]]:
-    """
-    Parse markdown content for render_diffs() and file:// links.
+    """Parse markdown content for render_diffs() and file:// links."""
+    diff_files: list[str] = []
+    read_files: list[str] = []
 
-    Args:
-        content: Markdown content to parse.
-
-    Returns:
-        Tuple of (diff_files, read_files):
-        - diff_files: Files mentioned in render_diffs() that need diffs generated
-        - read_files: Files in markdown links that should be read for context
-    """
-    diff_files = []
-    read_files = []
-
-    # Pattern for render_diffs(file:///path/to/file)
     render_diff_pattern = r"render_diffs\s*\(\s*file:///([^)]+)\s*\)"
     for match in re.finditer(render_diff_pattern, content):
-        path = unquote(match.group(1))
-        diff_files.append(normalize_file_uri_path(path))
+        diff_files.append(normalize_file_uri_path(unquote(match.group(1))))
 
-    # Pattern for markdown links: [text](file:///path)
-    # But exclude render_diffs matches
     link_pattern = r"\[([^\]]*)\]\(file:///([^)]+)\)"
     for match in re.finditer(link_pattern, content):
-        path = unquote(match.group(2))
-        full_path = normalize_file_uri_path(path)
-        # Don't duplicate files already in diff_files
+        full_path = normalize_file_uri_path(unquote(match.group(2)))
         if full_path not in diff_files:
             read_files.append(full_path)
 
     return diff_files, read_files
 
 
-def get_scoped_diff(files: list[str], target: str = "staged") -> str:
-    """
-    Get git diff for specific files only.
-
-    Args:
-        files: List of file paths to diff.
-        target: 'staged', 'unstaged', or a git ref.
-
-    Returns:
-        Combined diff output for the specified files.
-    """
+def get_scoped_diff(
+    files: list[str],
+    working_dir: str | Path,
+    target: str = "staged",
+) -> str:
+    """Get git diff for specific files only."""
     if not files:
         return ""
 
-    diffs = []
+    diffs: list[str] = []
     for filepath in files:
         try:
-            # Normalize path for git
-            normalized = Path(filepath).as_posix()
-
+            normalized = _path_for_git(filepath, working_dir)
             if target == "staged":
-                args = ["git", "diff", "--staged", "--", normalized]
+                args = ["diff", "--staged", "--", normalized]
             elif target == "unstaged":
-                args = ["git", "diff", "--", normalized]
+                args = ["diff", "--", normalized]
             else:
-                args = ["git", "diff", target, "--", normalized]
+                args = ["diff", target, "--", normalized]
 
-            result = subprocess.run(
-                args,
-                capture_output=True,
-                text=True,
-                check=True,
-                encoding="utf-8",
-                stdin=subprocess.DEVNULL,
-                timeout=30,
-            )
+            result = _run_git_command(working_dir, args)
             if result.stdout.strip():
                 diffs.append(f"# Diff for: {filepath}\n{result.stdout}")
         except subprocess.CalledProcessError:
             diffs.append(f"# No diff available for: {filepath}")
-        except Exception as e:
-            diffs.append(f"# Error getting diff for {filepath}: {e}")
+        except Exception as exc:
+            diffs.append(f"# Error getting diff for {filepath}: {exc}")
 
     return "\n\n".join(diffs)
 
 
-def process_artifact_with_links(
-    filepath: str, diff_target: str = "staged"
-) -> tuple[str, str]:
-    """
-    Read an artifact file and resolve its links.
-
-    Args:
-        filepath: Path to the artifact (e.g., walkthrough.md).
-        diff_target: Target for generating diffs.
-
-    Returns:
-        Tuple of (processed_content, scoped_diff):
-        - processed_content: The artifact with render_diffs replaced by actual diffs
-        - scoped_diff: Combined diff for all files mentioned in render_diffs
-    """
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-    except FileNotFoundError:
-        return f"(Artifact not found: {filepath})", ""
-
-    diff_files, read_files = parse_file_links(content)
-
-    # Generate scoped diff for render_diffs files
-    scoped_diff = get_scoped_diff(diff_files, diff_target)
-
-    # Replace render_diffs() calls with actual diff content
-    def replace_render_diff(match):
-        path = unquote(match.group(1))
-        full_path = normalize_file_uri_path(path)
-        # Get diff for this specific file
-        file_diff = get_scoped_diff([full_path], diff_target)
-        if file_diff:
-            return f"```diff\n{file_diff}\n```"
-        return f"(No changes in {full_path})"
-
-    processed = re.sub(
-        r"render_diffs\s*\(\s*file:///([^)]+)\s*\)", replace_render_diff, content
-    )
-
-    # Read linked files for additional context
-    linked_context = ""
-    for read_path in read_files[:5]:  # Limit to 5 linked files
-        try:
-            with open(read_path, "r", encoding="utf-8") as f:
-                file_content = f.read()
-                if len(file_content) > 10000:
-                    file_content = file_content[:10000] + "\n... [TRUNCATED]"
-                linked_context += (
-                    f"\n\n--- LINKED FILE: {read_path} ---\n{file_content}"
-                )
-        except Exception:
-            pass
-
-    return processed + linked_context, scoped_diff
+def _append_review_trace(review: str, trace: list[str], enabled: bool) -> str:
+    if not enabled:
+        return review
+    if not trace:
+        return f"{review}\n\n---\n## Review Trace\n- No trace events recorded."
+    trace_lines = "\n".join(f"- {item}" for item in trace)
+    return f"{review}\n\n---\n## Review Trace\n{trace_lines}"
 
 
-def generate_critique(diff: str, context: str = "") -> str:
-    """
-    Send diff and context to GLM-4.7 for review.
-
-    Args:
-        diff: The git diff output.
-        context: Optional context from artifact files.
-
-    Returns:
-        The code review from GLM-4.7.
-    """
-    api_key = os.getenv("ZHIPU_API_KEY")
-    if not api_key:
-        return "Error: ZHIPU_API_KEY environment variable is not set."
-
-    # Use the Z.AI coding endpoint as per docs
-    client = OpenAI(
-        api_key=api_key,
-        base_url="https://api.z.ai/api/coding/paas/v4",
-    )
-
-    system_prompt = """You are a Senior Code Reviewer. Your goal is to verify if the code changes
-match the intent described in the provided documentation.
-
-1. If 'implementation_plan.md' is provided, check if the planned steps were actually executed.
-2. If 'task.md' is provided, check for any missed requirements.
-3. Highlight LOGIC errors, SECURITY risks, or potential BUGS.
-4. Ignore minor style issues unless they impact readability significantly.
-5. Be concise but thorough. Focus on what matters."""
-
-    user_prompt = f"""# CONTEXT ARTIFACTS
-{context if context else "(No context files provided)"}
-
-# CODE CHANGES (DIFF)
-```diff
-{diff if diff else "(No changes detected)"}
-```
-
-Based on the artifacts and diff above, provide a code review. If there are no issues, say so briefly."""
-
-    try:
-        # Log the prompt sizes for debugging
-        logger.info(f"System Prompt Length: {len(system_prompt)} chars")
-        logger.info(f"User Prompt Length: {len(user_prompt)} chars")
-
-        response = client.chat.completions.create(
-            model="GLM-4.7",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.2,
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        logger.error(f"Error calling GLM-4.7 API in generate_critique: {e}")
-        return f"Error calling GLM-4.7 API: {e}"
+def _execute_tool(
+    name: str,
+    arguments: dict,
+    *,
+    working_dir: str | Path,
+) -> str:
+    """Execute a model tool and return its result as a string."""
+    if name == "get_uncommitted_changes":
+        return get_git_diff(working_dir, arguments.get("target", "staged"))
+    if name == "read_files":
+        return read_context_files(arguments.get("paths", []), working_dir)
+    if name == "read_file":
+        return read_context_files([arguments.get("path", "")], working_dir)
+    if name == "list_changed_files":
+        files = get_changed_files(working_dir)
+        return "\n".join(files) if files else "No changed files found."
+    return f"Unknown tool: {name}"
 
 
-# =============================================================================
-# AGENTIC REVIEW - GLM-4.7 decides what info to gather
-# =============================================================================
-
-# Define tools that GLM-4.7 can use
 REVIEWER_TOOLS = [
     {
         "type": "function",
@@ -381,17 +392,34 @@ REVIEWER_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_files",
-            "description": "Read the contents of one or more files. Use this to read source files, documentation, or any relevant context. You can request multiple files at once to be efficient.",
+            "description": "Read the contents of one or more files. OpenSpec change directories are also accepted and expanded into context files. Use this to read source files, documentation, or any relevant context.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of file paths to read (absolute or relative to cwd)",
+                        "description": "List of file paths or OpenSpec change directories to read (absolute or relative to cwd)",
                     }
                 },
                 "required": ["paths"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of one file. Prefer read_files when reading more than one file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path to read (absolute or relative to cwd)",
+                    }
+                },
+                "required": ["path"],
             },
         },
     },
@@ -410,128 +438,92 @@ REVIEWER_TOOLS = [
 ]
 
 
-def _execute_tool(name: str, arguments: dict) -> str:
-    """Execute a tool and return its result as a string."""
-    if name == "get_uncommitted_changes":
-        target = arguments.get("target", "staged")
-        return get_git_diff(target)
-    elif name == "read_files":
-        paths = arguments.get("paths", [])
-        return read_context_files(paths)
-    elif name == "read_file":
-        # Backwards compatibility
-        path = arguments.get("path", "")
-        return read_context_files([path])
-    elif name == "list_changed_files":
-        files = get_changed_files()
-        return "\n".join(files) if files else "No changed files found."
-    else:
-        return f"Unknown tool: {name}"
-
-
 def run_agentic_review(
     working_dir: str,
     diff_target: str = "staged",
     context_files: list[str] | None = None,
     focus_files: list[str] | None = None,
     task_description: str = "",
+    include_trace: bool | None = None,
 ) -> str:
     """
-    Run an agentic review where GLM-4.7 decides what information to gather.
-
-    Args:
-        working_dir: The git repository directory to run commands in.
-        diff_target: 'staged', 'unstaged', or a git ref.
-        context_files: Optional list of context files. If None, uses defaults.
-        focus_files: Optional list of files to focus the review on.
-        task_description: Optional description of the task being reviewed.
-
-    Returns:
-        The final code review from GLM-4.7.
+    Run an agentic review where GLM decides what information to gather.
     """
-    import json
+    trace_enabled = _env_flag("REVIEW_MCP_INCLUDE_TRACE") if include_trace is None else include_trace
+    trace: list[str] = []
 
-    # Save original directory and restore it on exit (safety sandwich)
-    original_cwd = os.getcwd()
-
-    # Validate working directory
-    if not os.path.exists(working_dir):
-        return f"Error: The directory '{working_dir}' does not exist."
+    repo_dir = Path(working_dir).resolve()
+    trace.append(f"Workspace: {repo_dir}")
+    trace.append(f"Diff target: {diff_target}")
+    if not repo_dir.exists():
+        return _append_review_trace(f"Error: The directory '{repo_dir}' does not exist.", trace, trace_enabled)
+    if not repo_dir.is_dir():
+        return _append_review_trace(f"Error: The path '{repo_dir}' is not a directory.", trace, trace_enabled)
 
     try:
-        # Change to the working directory so git commands work correctly
-        os.chdir(working_dir)
+        client = _make_client()
+    except ValueError as exc:
+        return _append_review_trace(f"Error: {exc}", trace, trace_enabled)
 
-        api_key = os.getenv("ZHIPU_API_KEY")
-        if not api_key:
-            return "Error: ZHIPU_API_KEY environment variable is not set."
+    context_files_to_read = context_files or []
+    context_file_content = ""
+    all_diff_files: list[str] = []
+    loaded_context_files: list[str] = []
 
-        # Configurable API endpoint
-        base_url = os.getenv("ZHIPU_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
+    logger.info("Loading context files...")
+    for context_entry in context_files_to_read:
+        resolved_context_entry = _resolve_user_path(context_entry, repo_dir)
+        expanded_context_files = expand_context_entry(context_entry, repo_dir)
+        if not expanded_context_files:
+            logger.warning("  ! No readable context files found for %s", resolved_context_entry)
+            continue
 
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=120.0,  # 2 minute timeout per request
-        )
+        if resolved_context_entry.is_dir():
+            context_file_content += f"\n\n--- CONTEXT DIRECTORY: {resolved_context_entry} ---"
 
-        # Default artifacts to ALWAYS check
-        default_artifacts = [
-            "implementation_plan.md",
-            "task.md",
-            "walkthrough.md",
-        ]
-        artifacts_to_read = default_artifacts + (context_files or [])
-
-        # Pre-read artifacts that exist AND resolve their links
-        artifact_context = ""
-        all_diff_files = []
-
-        logger.info("Loading artifacts...")
-        for artifact in artifacts_to_read:
+        for resolved_context_file in expanded_context_files:
             try:
-                with open(artifact, "r", encoding="utf-8") as f:
-                    content = f.read()
-                    logger.info(f"  ✓ Loaded {artifact}")
+                logger.info("  ✓ Loaded %s", resolved_context_file)
+                loaded_context_files.append(str(resolved_context_file))
 
-                    # Parse for render_diffs and file links
-                    diff_files, linked_files = parse_file_links(content)
-                    all_diff_files.extend(diff_files)
+                processed_content, diff_files = read_context_file_with_links(
+                    resolved_context_file,
+                    repo_dir,
+                    diff_target,
+                )
+                all_diff_files.extend(diff_files)
+                context_file_content += (
+                    f"\n\n--- CONTEXT FILE: {resolved_context_file} ---\n{processed_content}"
+                )
+            except Exception as exc:
+                logger.error("  ✗ Error loading %s: %s", resolved_context_file, exc)
 
-                    # Process the artifact - resolve render_diffs inline
-                    processed_content, _ = process_artifact_with_links(
-                        artifact, diff_target
-                    )
-                    artifact_context += (
-                        f"\n\n--- ARTIFACT: {artifact} ---\n{processed_content}"
-                    )
+    trace.append(f"Context entries requested: {len(context_files_to_read)}")
+    trace.append(f"Context files loaded: {len(loaded_context_files)}")
 
-            except FileNotFoundError:
-                pass  # Silently skip missing artifacts
-            except Exception as e:
-                logger.error(f"  ✗ Error loading {artifact}: {e}")
+    if focus_files:
+        files_to_diff = focus_files
+        logger.info("Focusing on %s specified files", len(files_to_diff))
+    elif all_diff_files:
+        files_to_diff = all_diff_files
+        logger.info("Found %s files in context files", len(files_to_diff))
+    else:
+        files_to_diff = None
+        logger.info("No specific files - reviewer will decide")
 
-        # Determine which files to diff
-        # Priority: focus_files > files from artifacts > all changed files
-        if focus_files:
-            files_to_diff = focus_files
-            logger.info(f"Focusing on {len(files_to_diff)} specified files")
-        elif all_diff_files:
-            files_to_diff = all_diff_files
-            logger.info(f"Found {len(files_to_diff)} files in artifacts")
-        else:
-            files_to_diff = None  # Let reviewer fetch what it needs
-            logger.info("No specific files - reviewer will decide")
+    if files_to_diff:
+        diff_content = get_scoped_diff(files_to_diff, repo_dir, diff_target)
+        changed_files = files_to_diff
+    else:
+        diff_content = ""
+        changed_files = []
+    trace.append(f"Files selected for initial diff: {len(changed_files)}")
+    if diff_content:
+        trace.append(f"Initial diff size: {len(diff_content)} chars")
+    else:
+        trace.append("Initial diff size: 0 chars")
 
-        # Pre-fetch diffs if we have specific files
-        if files_to_diff:
-            diff_content = get_scoped_diff(files_to_diff, diff_target)
-            changed_files = files_to_diff
-        else:
-            diff_content = ""
-            changed_files = []
-
-        system_prompt = """You are a Senior Code Reviewer with access to tools.
+    system_prompt = """You are a Senior Code Reviewer with access to tools.
 
 Your job is to review code changes. You have access to these tools:
 - get_uncommitted_changes: Get git diffs (staged, unstaged, or vs specific refs)
@@ -549,131 +541,114 @@ REVIEW FOCUS:
 
 Be concise but thorough. Ignore minor style issues."""
 
-        # Build initial user message with pre-fetched context
-        sections = []
+    sections: list[str] = []
+    if task_description:
+        sections.append(f"## Task Description\n{task_description}")
+    if context_file_content.strip():
+        sections.append(f"## Context Files\n{context_file_content}")
+    if changed_files:
+        sections.append(f"## Files to Review\n{chr(10).join(changed_files)}")
+    if diff_content.strip():
+        sections.append(f"## Git Diff ({diff_target})\n```diff\n{diff_content}\n```")
 
-        if task_description:
-            sections.append(f"## Task Description\n{task_description}")
+    if sections:
+        user_message = "Please review the following:\n\n" + "\n\n".join(sections)
+        user_message += "\n\n---\nProvide a thorough code review. Use your tools if you need more information."
+    else:
+        user_message = "Please review the current code changes. Use list_changed_files and get_uncommitted_changes to see what's been modified."
 
-        if artifact_context.strip():
-            sections.append(f"## Project Artifacts\n{artifact_context}")
+    messages: list[dict | object] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_message},
+    ]
 
-        if changed_files:
-            sections.append(f"## Files to Review\n{chr(10).join(changed_files)}")
+    max_iterations = _get_max_iterations()
+    trace.append(f"Max review iterations: {max_iterations}")
+    logger.info("Starting review...")
+    logger.info("Found %s changed files", len(changed_files))
+    logger.info("Loaded %s context file paths", len(loaded_context_files))
 
-        if diff_content.strip():
-            sections.append(
-                f"## Git Diff ({diff_target})\n```diff\n{diff_content}\n```"
-            )
+    for iteration in range(max_iterations):
+        logger.info("Iteration %s: Calling GLM...", iteration + 1)
+        total_chars = 0
+        for message in messages:
+            if isinstance(message, dict):
+                total_chars += len(message.get("content", "") or "")
+            else:
+                total_chars += len(getattr(message, "content", "") or "")
+        logger.info("  Payload size: %s chars, %s messages", total_chars, len(messages))
+        trace.append(
+            f"Iteration {iteration + 1}: payload {total_chars} chars across {len(messages)} messages"
+        )
 
-        if sections:
-            user_message = "Please review the following:\n\n" + "\n\n".join(sections)
-            user_message += "\n\n---\nProvide a thorough code review. Use your tools if you need more information."
-        else:
-            user_message = "Please review the current code changes. Use list_changed_files and get_uncommitted_changes to see what's been modified."
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
-
-        # Configurable max iterations
-        max_iterations = int(os.getenv("MAX_REVIEW_ITERATIONS", "20"))
-        iteration = 0
-        logger.info("Starting review...")
-        logger.info(f"Found {len(changed_files)} changed files")
-        logger.info(f"Loaded {len(artifacts_to_read)} artifacts")
-
-        for iteration in range(max_iterations):
-            logger.info(f"Iteration {iteration + 1}: Calling GLM-4.7...")
-
-            # Log exact payload size for debugging
-            total_chars = 0
-            for m in messages:
-                if isinstance(m, dict):
-                    content = m.get("content", "")
-                else:
-                    content = getattr(m, "content", "")
-                total_chars += len(content or "")
-
-            logger.info(
-                f"  Payload size: {total_chars} chars, {len(messages)} messages"
-            )
-
-            import time
-
-            backoff = 1
-            response = None
-            for retry in range(3):
-                try:
-                    response = client.chat.completions.create(
-                        model="GLM-4.7",
-                        messages=messages,
-                        tools=REVIEWER_TOOLS,
-                        tool_choice="auto",
-                        temperature=0.2,
-                    )
-                    break  # Success
-                except Exception as e:
-                    if retry < 2 and any(
-                        code in str(e) for code in ["500", "502", "503", "429"]
-                    ):
-                        logger.warning(
-                            f"  Retry {retry + 1} due to {e}. Waiting {backoff}s..."
-                        )
-                        time.sleep(backoff)
-                        backoff *= 2
-                        continue
-
-                    # Provide much more detail for debugging
-                    error_msg = (
-                        f"Error calling GLM-4.7 API at iteration {iteration + 1}: {e}"
-                    )
-                    logger.error(error_msg)
-
-                    # Check for specific error types if possible
-                    if "502" in str(e) or "500" in str(e):
-                        error_msg += "\n\nTIP: This often happens if the context is too large or the payload is complex. Try reducing the number of focus_files or artifacts."
-
-                    return error_msg
-
-            message = response.choices[0].message
-
-            # If no tool calls, we're done - return the final message
-            if not message.tool_calls:
-                logger.info("Review complete!")
-                return message.content or "No review generated."
-
-            # Process tool calls
-            messages.append(message)
-            logger.info(f"GLM requested {len(message.tool_calls)} tool(s)")
-
-            for tool_call in message.tool_calls:
-                func_name = tool_call.function.name
-                try:
-                    func_args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError:
-                    func_args = {}
-
-                logger.info(f"  → {func_name}({func_args})")
-
-                # Execute the tool
-                result = _execute_tool(func_name, func_args)
-
-                # Add tool result to messages
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tool_call.id,
-                        "content": result,
-                    }
+        backoff = 1
+        response = None
+        for retry in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model="GLM-4.7",
+                    messages=messages,
+                    tools=REVIEWER_TOOLS,
+                    tool_choice="auto",
+                    temperature=0.2,
                 )
+                break
+            except Exception as exc:
+                retryable = any(code in str(exc) for code in ["500", "502", "503", "429"])
+                if retry < 2 and retryable:
+                    logger.warning("  Retry %s due to %s. Waiting %ss...", retry + 1, exc, backoff)
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
 
-        return "Error: Maximum iterations reached without completing review."
+                error_msg = f"Error calling GLM-4.7 API at iteration {iteration + 1}: {exc}"
+                logger.error(error_msg)
+                if "502" in str(exc) or "500" in str(exc):
+                    error_msg += "\n\nTIP: This often happens if the context is too large or the payload is complex. Try reducing the number of focus_files or context_files."
+                return _append_review_trace(error_msg, trace, trace_enabled)
 
-    except Exception as e:
-        return f"Error during review: {e}"
+        if response is None:
+            return _append_review_trace(
+                "Error: Model call did not return a response.",
+                trace,
+                trace_enabled,
+            )
 
-    finally:
-        # Always restore the original directory
-        os.chdir(original_cwd)
+        message = response.choices[0].message
+        if not message.tool_calls:
+            logger.info("Review complete!")
+            trace.append(f"Review complete after {iteration + 1} iteration(s)")
+            return _append_review_trace(message.content or "No review generated.", trace, trace_enabled)
+
+        messages.append(message)
+        logger.info("GLM requested %s tool(s)", len(message.tool_calls))
+        trace.append(f"Iteration {iteration + 1}: model requested {len(message.tool_calls)} tool call(s)")
+
+        for tool_call in message.tool_calls:
+            func_name = tool_call.function.name
+            try:
+                func_args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                logger.warning(
+                    "Invalid JSON arguments for %s: %r",
+                    func_name,
+                    tool_call.function.arguments,
+                )
+                func_args = {}
+
+            logger.info("  → %s(%s)", func_name, func_args)
+            result = _execute_tool(func_name, func_args, working_dir=repo_dir)
+            trace.append(f"Tool call: {func_name} -> {len(result)} chars")
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result,
+                }
+            )
+
+    return _append_review_trace(
+        "Error: Maximum iterations reached without completing review.",
+        trace,
+        trace_enabled,
+    )
