@@ -43,11 +43,22 @@ EXCLUDE_PATTERNS = [
     "pnpm-lock.yaml",
 ]
 
-DEFAULT_ARTIFACTS = [
-    "implementation_plan.md",
-    "task.md",
-    "walkthrough.md",
-]
+MAX_ALLOWED_ITERATIONS = 50
+MAX_CONTEXT_FILES_PER_DIRECTORY = 50
+CONTEXT_DIRECTORY_SUFFIXES = {".md", ".txt", ".yaml", ".yml", ".json"}
+OPENSPEC_ROOT_FILE_ORDER = {
+    "proposal.md": 0,
+    "design.md": 1,
+    "tasks.md": 2,
+}
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Parse a boolean environment flag."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _get_max_iterations() -> int:
@@ -62,6 +73,13 @@ def _get_max_iterations() -> int:
     if value < 1:
         logger.warning("MAX_REVIEW_ITERATIONS must be >= 1; defaulting to 20")
         return 20
+    if value > MAX_ALLOWED_ITERATIONS:
+        logger.warning(
+            "MAX_REVIEW_ITERATIONS=%s is too high; capping at %s",
+            value,
+            MAX_ALLOWED_ITERATIONS,
+        )
+        return MAX_ALLOWED_ITERATIONS
     return value
 
 
@@ -97,6 +115,53 @@ def _path_for_git(path: str | Path, working_dir: str | Path) -> str:
         return resolved.relative_to(Path(working_dir)).as_posix()
     except ValueError:
         return resolved.as_posix()
+
+
+def _looks_like_openspec_change_dir(path: Path) -> bool:
+    """Detect an explicitly provided OpenSpec change directory."""
+    if not path.is_dir():
+        return False
+
+    has_openspec_layout = (path / "proposal.md").exists() or (path / "tasks.md").exists()
+    has_specs_dir = (path / "specs").is_dir()
+    return has_openspec_layout or has_specs_dir
+
+
+def _context_path_sort_key(path: Path, root: Path) -> tuple[int, str]:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        relative = path
+
+    if len(relative.parts) == 1:
+        priority = OPENSPEC_ROOT_FILE_ORDER.get(relative.name, 10)
+    elif relative.parts[0] == "specs":
+        priority = 20
+    else:
+        priority = 30
+    return priority, relative.as_posix()
+
+
+def expand_context_entry(path: str | Path, working_dir: str | Path) -> list[Path]:
+    """Expand a context file entry into one or more readable context files."""
+    resolved = _resolve_user_path(path, working_dir)
+    if resolved.is_file():
+        return [resolved]
+    if not resolved.is_dir():
+        return []
+    if not _looks_like_openspec_change_dir(resolved):
+        return []
+
+    files = [
+        candidate
+        for candidate in resolved.rglob("*")
+        if candidate.is_file()
+        and not any(part.startswith(".") for part in candidate.relative_to(resolved).parts)
+        and candidate.suffix.lower() in CONTEXT_DIRECTORY_SUFFIXES
+    ]
+    return sorted(files, key=lambda candidate: _context_path_sort_key(candidate, resolved))[
+        :MAX_CONTEXT_FILES_PER_DIRECTORY
+    ]
 
 
 def _make_client():
@@ -154,17 +219,68 @@ def read_context_files(filepaths: list[str], working_dir: str | Path) -> str:
     """Read multiple context files and format them for the prompt."""
     context_chunks: list[str] = []
     for filepath in filepaths:
-        resolved = _resolve_user_path(filepath, working_dir)
-        try:
-            content = resolved.read_text(encoding="utf-8")
-            if len(content) > 50000:
-                content = content[:50000] + "\n\n... [TRUNCATED] ..."
-            context_chunks.append(f"\n\n--- FILE: {resolved} ---\n{content}")
-        except FileNotFoundError:
-            context_chunks.append(f"\n\n(Note: Context file '{resolved}' not found)\n")
-        except Exception as exc:
-            context_chunks.append(f"\n\n(Error reading '{resolved}': {exc})\n")
+        resolved_paths = expand_context_entry(filepath, working_dir)
+        if not resolved_paths:
+            resolved = _resolve_user_path(filepath, working_dir)
+            context_chunks.append(f"\n\n(Note: Context file '{resolved}' not found or not readable)\n")
+            continue
+
+        if len(resolved_paths) > 1:
+            source = _resolve_user_path(filepath, working_dir)
+            context_chunks.append(f"\n\n--- CONTEXT DIRECTORY: {source} ---")
+
+        for resolved in resolved_paths:
+            try:
+                content = resolved.read_text(encoding="utf-8")
+                if len(content) > 50000:
+                    content = content[:50000] + "\n\n... [TRUNCATED] ..."
+                context_chunks.append(f"\n\n--- FILE: {resolved} ---\n{content}")
+            except FileNotFoundError:
+                context_chunks.append(f"\n\n(Note: Context file '{resolved}' not found)\n")
+            except Exception as exc:
+                context_chunks.append(f"\n\n(Error reading '{resolved}': {exc})\n")
     return "".join(context_chunks)
+
+
+def read_context_file_with_links(
+    filepath: str | Path,
+    working_dir: str | Path,
+    diff_target: str = "staged",
+) -> tuple[str, list[str]]:
+    """Read one context file and resolve render_diffs/file links."""
+    resolved = _resolve_user_path(filepath, working_dir)
+    try:
+        content = resolved.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return f"(Context file not found: {resolved})", []
+
+    diff_files, read_files = parse_file_links(content)
+
+    def replace_render_diff(match: re.Match[str]) -> str:
+        full_path = normalize_file_uri_path(unquote(match.group(1)))
+        file_diff = get_scoped_diff([full_path], working_dir, diff_target)
+        if file_diff:
+            return f"```diff\n{file_diff}\n```"
+        return f"(No changes in {full_path})"
+
+    processed = re.sub(
+        r"render_diffs\s*\(\s*file:///([^)]+)\s*\)",
+        replace_render_diff,
+        content,
+    )
+
+    linked_context = ""
+    for read_path in read_files[:5]:
+        try:
+            linked_file = _resolve_user_path(read_path, working_dir)
+            file_content = linked_file.read_text(encoding="utf-8")
+            if len(file_content) > 10000:
+                file_content = file_content[:10000] + "\n... [TRUNCATED]"
+            linked_context += f"\n\n--- LINKED FILE: {linked_file} ---\n{file_content}"
+        except Exception:
+            pass
+
+    return processed + linked_context, diff_files
 
 
 def normalize_file_uri_path(path: str) -> str:
@@ -225,46 +341,13 @@ def get_scoped_diff(
     return "\n\n".join(diffs)
 
 
-def process_artifact_with_links(
-    filepath: str,
-    working_dir: str | Path,
-    diff_target: str = "staged",
-) -> tuple[str, str]:
-    """Read an artifact file and resolve render_diffs/file links."""
-    resolved = _resolve_user_path(filepath, working_dir)
-    try:
-        content = resolved.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return f"(Artifact not found: {resolved})", ""
-
-    diff_files, read_files = parse_file_links(content)
-    scoped_diff = get_scoped_diff(diff_files, working_dir, diff_target)
-
-    def replace_render_diff(match: re.Match[str]) -> str:
-        full_path = normalize_file_uri_path(unquote(match.group(1)))
-        file_diff = get_scoped_diff([full_path], working_dir, diff_target)
-        if file_diff:
-            return f"```diff\n{file_diff}\n```"
-        return f"(No changes in {full_path})"
-
-    processed = re.sub(
-        r"render_diffs\s*\(\s*file:///([^)]+)\s*\)",
-        replace_render_diff,
-        content,
-    )
-
-    linked_context = ""
-    for read_path in read_files[:5]:
-        try:
-            linked_file = _resolve_user_path(read_path, working_dir)
-            file_content = linked_file.read_text(encoding="utf-8")
-            if len(file_content) > 10000:
-                file_content = file_content[:10000] + "\n... [TRUNCATED]"
-            linked_context += f"\n\n--- LINKED FILE: {linked_file} ---\n{file_content}"
-        except Exception:
-            pass
-
-    return processed + linked_context, scoped_diff
+def _append_review_trace(review: str, trace: list[str], enabled: bool) -> str:
+    if not enabled:
+        return review
+    if not trace:
+        return f"{review}\n\n---\n## Review Trace\n- No trace events recorded."
+    trace_lines = "\n".join(f"- {item}" for item in trace)
+    return f"{review}\n\n---\n## Review Trace\n{trace_lines}"
 
 
 def _execute_tool(
@@ -309,17 +392,34 @@ REVIEWER_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_files",
-            "description": "Read the contents of one or more files. Use this to read source files, documentation, or any relevant context. You can request multiple files at once to be efficient.",
+            "description": "Read the contents of one or more files. OpenSpec change directories are also accepted and expanded into context files. Use this to read source files, documentation, or any relevant context.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "paths": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "List of file paths to read (absolute or relative to cwd)",
+                        "description": "List of file paths or OpenSpec change directories to read (absolute or relative to cwd)",
                     }
                 },
                 "required": ["paths"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of one file. Prefer read_files when reading more than one file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "File path to read (absolute or relative to cwd)",
+                    }
+                },
+                "required": ["path"],
             },
         },
     },
@@ -344,51 +444,69 @@ def run_agentic_review(
     context_files: list[str] | None = None,
     focus_files: list[str] | None = None,
     task_description: str = "",
+    include_trace: bool | None = None,
 ) -> str:
     """
     Run an agentic review where GLM decides what information to gather.
     """
+    trace_enabled = _env_flag("REVIEW_MCP_INCLUDE_TRACE") if include_trace is None else include_trace
+    trace: list[str] = []
+
     repo_dir = Path(working_dir).resolve()
+    trace.append(f"Workspace: {repo_dir}")
+    trace.append(f"Diff target: {diff_target}")
     if not repo_dir.exists():
-        return f"Error: The directory '{repo_dir}' does not exist."
+        return _append_review_trace(f"Error: The directory '{repo_dir}' does not exist.", trace, trace_enabled)
     if not repo_dir.is_dir():
-        return f"Error: The path '{repo_dir}' is not a directory."
+        return _append_review_trace(f"Error: The path '{repo_dir}' is not a directory.", trace, trace_enabled)
 
     try:
         client = _make_client()
     except ValueError as exc:
-        return f"Error: {exc}"
+        return _append_review_trace(f"Error: {exc}", trace, trace_enabled)
 
-    artifacts_to_read = DEFAULT_ARTIFACTS + (context_files or [])
-    artifact_context = ""
+    context_files_to_read = context_files or []
+    context_file_content = ""
     all_diff_files: list[str] = []
+    loaded_context_files: list[str] = []
 
-    logger.info("Loading artifacts...")
-    for artifact in artifacts_to_read:
-        resolved_artifact = _resolve_user_path(artifact, repo_dir)
-        try:
-            content = resolved_artifact.read_text(encoding="utf-8")
-            logger.info("  ✓ Loaded %s", resolved_artifact)
-            diff_files, _ = parse_file_links(content)
-            all_diff_files.extend(diff_files)
-
-            processed_content, _ = process_artifact_with_links(
-                artifact,
-                repo_dir,
-                diff_target,
-            )
-            artifact_context += f"\n\n--- ARTIFACT: {resolved_artifact} ---\n{processed_content}"
-        except FileNotFoundError:
+    logger.info("Loading context files...")
+    for context_entry in context_files_to_read:
+        resolved_context_entry = _resolve_user_path(context_entry, repo_dir)
+        expanded_context_files = expand_context_entry(context_entry, repo_dir)
+        if not expanded_context_files:
+            logger.warning("  ! No readable context files found for %s", resolved_context_entry)
             continue
-        except Exception as exc:
-            logger.error("  ✗ Error loading %s: %s", resolved_artifact, exc)
+
+        if resolved_context_entry.is_dir():
+            context_file_content += f"\n\n--- CONTEXT DIRECTORY: {resolved_context_entry} ---"
+
+        for resolved_context_file in expanded_context_files:
+            try:
+                logger.info("  ✓ Loaded %s", resolved_context_file)
+                loaded_context_files.append(str(resolved_context_file))
+
+                processed_content, diff_files = read_context_file_with_links(
+                    resolved_context_file,
+                    repo_dir,
+                    diff_target,
+                )
+                all_diff_files.extend(diff_files)
+                context_file_content += (
+                    f"\n\n--- CONTEXT FILE: {resolved_context_file} ---\n{processed_content}"
+                )
+            except Exception as exc:
+                logger.error("  ✗ Error loading %s: %s", resolved_context_file, exc)
+
+    trace.append(f"Context entries requested: {len(context_files_to_read)}")
+    trace.append(f"Context files loaded: {len(loaded_context_files)}")
 
     if focus_files:
         files_to_diff = focus_files
         logger.info("Focusing on %s specified files", len(files_to_diff))
     elif all_diff_files:
         files_to_diff = all_diff_files
-        logger.info("Found %s files in artifacts", len(files_to_diff))
+        logger.info("Found %s files in context files", len(files_to_diff))
     else:
         files_to_diff = None
         logger.info("No specific files - reviewer will decide")
@@ -399,6 +517,11 @@ def run_agentic_review(
     else:
         diff_content = ""
         changed_files = []
+    trace.append(f"Files selected for initial diff: {len(changed_files)}")
+    if diff_content:
+        trace.append(f"Initial diff size: {len(diff_content)} chars")
+    else:
+        trace.append("Initial diff size: 0 chars")
 
     system_prompt = """You are a Senior Code Reviewer with access to tools.
 
@@ -421,8 +544,8 @@ Be concise but thorough. Ignore minor style issues."""
     sections: list[str] = []
     if task_description:
         sections.append(f"## Task Description\n{task_description}")
-    if artifact_context.strip():
-        sections.append(f"## Project Artifacts\n{artifact_context}")
+    if context_file_content.strip():
+        sections.append(f"## Context Files\n{context_file_content}")
     if changed_files:
         sections.append(f"## Files to Review\n{chr(10).join(changed_files)}")
     if diff_content.strip():
@@ -440,9 +563,10 @@ Be concise but thorough. Ignore minor style issues."""
     ]
 
     max_iterations = _get_max_iterations()
+    trace.append(f"Max review iterations: {max_iterations}")
     logger.info("Starting review...")
     logger.info("Found %s changed files", len(changed_files))
-    logger.info("Loaded %s artifact paths", len(artifacts_to_read))
+    logger.info("Loaded %s context file paths", len(loaded_context_files))
 
     for iteration in range(max_iterations):
         logger.info("Iteration %s: Calling GLM...", iteration + 1)
@@ -453,6 +577,9 @@ Be concise but thorough. Ignore minor style issues."""
             else:
                 total_chars += len(getattr(message, "content", "") or "")
         logger.info("  Payload size: %s chars, %s messages", total_chars, len(messages))
+        trace.append(
+            f"Iteration {iteration + 1}: payload {total_chars} chars across {len(messages)} messages"
+        )
 
         backoff = 1
         response = None
@@ -477,29 +604,41 @@ Be concise but thorough. Ignore minor style issues."""
                 error_msg = f"Error calling GLM-4.7 API at iteration {iteration + 1}: {exc}"
                 logger.error(error_msg)
                 if "502" in str(exc) or "500" in str(exc):
-                    error_msg += "\n\nTIP: This often happens if the context is too large or the payload is complex. Try reducing the number of focus_files or artifacts."
-                return error_msg
+                    error_msg += "\n\nTIP: This often happens if the context is too large or the payload is complex. Try reducing the number of focus_files or context_files."
+                return _append_review_trace(error_msg, trace, trace_enabled)
 
         if response is None:
-            return "Error: Model call did not return a response."
+            return _append_review_trace(
+                "Error: Model call did not return a response.",
+                trace,
+                trace_enabled,
+            )
 
         message = response.choices[0].message
         if not message.tool_calls:
             logger.info("Review complete!")
-            return message.content or "No review generated."
+            trace.append(f"Review complete after {iteration + 1} iteration(s)")
+            return _append_review_trace(message.content or "No review generated.", trace, trace_enabled)
 
         messages.append(message)
         logger.info("GLM requested %s tool(s)", len(message.tool_calls))
+        trace.append(f"Iteration {iteration + 1}: model requested {len(message.tool_calls)} tool call(s)")
 
         for tool_call in message.tool_calls:
             func_name = tool_call.function.name
             try:
                 func_args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
+                logger.warning(
+                    "Invalid JSON arguments for %s: %r",
+                    func_name,
+                    tool_call.function.arguments,
+                )
                 func_args = {}
 
             logger.info("  → %s(%s)", func_name, func_args)
             result = _execute_tool(func_name, func_args, working_dir=repo_dir)
+            trace.append(f"Tool call: {func_name} -> {len(result)} chars")
             messages.append(
                 {
                     "role": "tool",
@@ -508,4 +647,8 @@ Be concise but thorough. Ignore minor style issues."""
                 }
             )
 
-    return "Error: Maximum iterations reached without completing review."
+    return _append_review_trace(
+        "Error: Maximum iterations reached without completing review.",
+        trace,
+        trace_enabled,
+    )
