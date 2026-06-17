@@ -108,6 +108,8 @@ OpenSpec change folders are included only when the MCP caller passes the folder 
 
 If MCP calls feel opaque, set `include_trace` to `true` for a single call or set `REVIEW_MCP_INCLUDE_TRACE=true` in the environment. The returned review will include a compact trace with the workspace, diff target, context-file count, payload sizes, model iterations, and tool calls.
 
+Trace output is meant for debugging review behavior and can be disabled again once the setup is behaving as expected.
+
 ## Codex / VS Code Notes
 
 This server now starts cleanly under MCP hosts because it avoids doing heavy work at import time. A few setup notes still matter:
