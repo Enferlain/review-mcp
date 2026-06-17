@@ -350,6 +350,25 @@ def _append_review_trace(review: str, trace: list[str], enabled: bool) -> str:
     return f"{review}\n\n---\n## Review Trace\n{trace_lines}"
 
 
+def _message_content_to_text(content: object) -> str:
+    """Normalize provider message content into text."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return str(content)
+
+
 def _execute_tool(
     name: str,
     arguments: dict,
@@ -568,6 +587,7 @@ Be concise but thorough. Ignore minor style issues."""
     logger.info("Found %s changed files", len(changed_files))
     logger.info("Loaded %s context file paths", len(loaded_context_files))
 
+    empty_final_retry_sent = False
     for iteration in range(max_iterations):
         logger.info("Iteration %s: Calling GLM...", iteration + 1)
         total_chars = 0
@@ -617,8 +637,30 @@ Be concise but thorough. Ignore minor style issues."""
         message = response.choices[0].message
         if not message.tool_calls:
             logger.info("Review complete!")
-            trace.append(f"Review complete after {iteration + 1} iteration(s)")
-            return _append_review_trace(message.content or "No review generated.", trace, trace_enabled)
+            content = _message_content_to_text(message.content)
+            if content.strip():
+                trace.append(f"Review complete after {iteration + 1} iteration(s)")
+                return _append_review_trace(content, trace, trace_enabled)
+
+            if not empty_final_retry_sent and iteration + 1 < max_iterations:
+                empty_final_retry_sent = True
+                trace.append(
+                    f"Iteration {iteration + 1}: model returned an empty final response; requesting review text"
+                )
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "You returned an empty response. Provide the final code review now. "
+                            "If there are no reviewable diffs, say that explicitly and summarize "
+                            "what diffs and changed files were checked."
+                        ),
+                    }
+                )
+                continue
+
+            trace.append(f"Review completed with empty content after {iteration + 1} iteration(s)")
+            return _append_review_trace("No review generated.", trace, trace_enabled)
 
         messages.append(message)
         logger.info("GLM requested %s tool(s)", len(message.tool_calls))
