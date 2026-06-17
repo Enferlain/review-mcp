@@ -221,6 +221,9 @@ def read_context_files(filepaths: list[str] | str | None, working_dir: str | Pat
         return ""
     if isinstance(filepaths, str):
         filepaths = [filepaths]
+    filepaths = [filepath for filepath in filepaths if filepath and filepath.strip()]
+    if not filepaths:
+        return ""
 
     context_chunks: list[str] = []
     for filepath in filepaths:
@@ -595,6 +598,7 @@ Be concise but thorough. Ignore minor style issues."""
         {"role": "user", "content": user_message},
     ]
 
+    model_name = os.getenv("AI_MODEL") or os.getenv("ZHIPU_MODEL") or "GLM-4.7"
     max_iterations = _get_max_iterations()
     trace.append(f"Max review iterations: {max_iterations}")
     logger.info("Starting review...")
@@ -620,7 +624,7 @@ Be concise but thorough. Ignore minor style issues."""
         for retry in range(3):
             try:
                 response = client.chat.completions.create(
-                    model=os.getenv("AI_MODEL") or os.getenv("ZHIPU_MODEL") or "GLM-4.7",
+                    model=model_name,
                     messages=messages,
                     tools=REVIEWER_TOOLS,
                     tool_choice="auto",
@@ -635,7 +639,7 @@ Be concise but thorough. Ignore minor style issues."""
                     backoff *= 2
                     continue
 
-                error_msg = f"Error calling GLM-4.7 API at iteration {iteration + 1}: {exc}"
+                error_msg = f"Error calling model '{model_name}' API at iteration {iteration + 1}: {exc}"
                 logger.error(error_msg)
                 if "502" in str(exc) or "500" in str(exc):
                     error_msg += "\n\nTIP: This often happens if the context is too large or the payload is complex. Try reducing the number of focus_files or context_files."

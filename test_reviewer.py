@@ -50,6 +50,7 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             context_file.write_text("context body", encoding="utf-8")
 
             self.assertEqual(reviewer.read_context_files(None, tmpdir), "")
+            self.assertEqual(reviewer.read_context_files(["", "   "], tmpdir), "")
             result = reviewer.read_context_files(str(context_file), tmpdir)
 
         self.assertIn("context body", result)
@@ -157,6 +158,17 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
                     reviewer.run_agentic_review(working_dir=tmpdir)
 
         self.assertEqual(fake_client.chat.completions.create.call_args.kwargs["model"], "GLM-5.1")
+
+    def test_api_error_mentions_selected_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_client = mock.Mock()
+            fake_client.chat.completions.create.side_effect = RuntimeError("boom")
+
+            with mock.patch.dict(os.environ, {"AI_MODEL": "GLM-5.1"}, clear=False):
+                with mock.patch("reviewer._make_client", return_value=fake_client):
+                    result = reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertIn("Error calling model 'GLM-5.1' API", result)
 
     def test_non_dict_tool_arguments_are_ignored(self) -> None:
         result = reviewer._execute_tool("read_files", ["not", "a", "dict"], working_dir=".")
