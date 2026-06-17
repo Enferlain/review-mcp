@@ -60,6 +60,43 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertIn(f"- Workspace: {tmpdir}", result)
         self.assertIn("- Diff target: staged", result)
 
+    def test_empty_final_response_gets_one_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            empty_message = mock.Mock()
+            empty_message.tool_calls = None
+            empty_message.content = ""
+            final_message = mock.Mock()
+            final_message.tool_calls = None
+            final_message.content = "final review"
+
+            fake_client = mock.Mock()
+            fake_client.chat.completions.create.side_effect = [
+                mock.Mock(choices=[mock.Mock(message=empty_message)]),
+                mock.Mock(choices=[mock.Mock(message=final_message)]),
+            ]
+
+            with mock.patch("reviewer._make_client", return_value=fake_client):
+                result = reviewer.run_agentic_review(working_dir=tmpdir, include_trace=True)
+
+        self.assertIn("final review", result)
+        self.assertIn("model returned an empty final response", result)
+        self.assertEqual(fake_client.chat.completions.create.call_count, 2)
+
+    def test_structured_final_response_content_is_supported(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_client = mock.Mock()
+            fake_message = mock.Mock()
+            fake_message.tool_calls = None
+            fake_message.content = [{"type": "text", "text": "structured review"}]
+            fake_response = mock.Mock()
+            fake_response.choices = [mock.Mock(message=fake_message)]
+            fake_client.chat.completions.create.return_value = fake_response
+
+            with mock.patch("reviewer._make_client", return_value=fake_client):
+                result = reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertEqual(result, "structured review")
+
     def test_openspec_change_directory_expands_to_context_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             change_dir = Path(tmpdir) / "openspec" / "changes" / "resource-intelligence-system"
