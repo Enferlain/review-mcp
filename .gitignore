@@ -1,3 +1,6 @@
 __pycache__
 .env
 uv.lock
+*egg-info
+.venv-wsl
+.venv

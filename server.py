@@ -2,14 +2,16 @@
 MCP server entrypoint for agentic code review.
 """
 
-from __future__ import annotations
-
 import argparse
 import os
 import sys
+import time
+from typing import Awaitable, Callable
 
 import anyio
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
+
+DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS = 1800
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -25,6 +27,98 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _get_tool_timeout_seconds() -> int:
+    """Return a safe tool timeout that stays ahead of host-level deadlines."""
+    raw_value = os.getenv("REVIEW_TOOL_TIMEOUT_SECONDS", str(DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS))
+    try:
+        value = int(raw_value)
+    except ValueError:
+        print(
+            f"[ReviewMCP] Invalid REVIEW_TOOL_TIMEOUT_SECONDS={raw_value!r}; "
+            f"defaulting to {DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS}",
+            file=sys.stderr,
+        )
+        return DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS
+
+    if value < 1:
+        print(
+            "[ReviewMCP] REVIEW_TOOL_TIMEOUT_SECONDS must be >= 1; "
+            f"defaulting to {DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS}",
+            file=sys.stderr,
+        )
+        return DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS
+    return value
+
+
+async def _send_status_safely(
+    status_reporter: Callable[[str, float | None, float | None], Awaitable[None]],
+    message: str,
+    progress: float | None = None,
+    total: float | None = None,
+) -> None:
+    """Best-effort MCP status reporting that never fails the review."""
+    try:
+        await status_reporter(message, progress, total)
+    except Exception as exc:
+        print(f"[ReviewMCP] Could not send status update: {exc}", file=sys.stderr)
+
+
+async def _run_review_with_timeout(
+    review_call: Callable[[], str],
+    timeout_seconds: float,
+    status_reporter: Callable[[str, float | None, float | None], Awaitable[None]] | None = None,
+    status_interval_seconds: float = 30.0,
+) -> str:
+    """Run the blocking review call with status heartbeats and a user-facing timeout."""
+    timeout_seconds = float(timeout_seconds)
+    result: str | None = None
+    finished = anyio.Event()
+
+    async def run_review() -> None:
+        nonlocal result
+        try:
+            result = await anyio.to_thread.run_sync(
+                review_call,
+                abandon_on_cancel=True,
+            )
+        finally:
+            finished.set()
+
+    async def report_heartbeat() -> None:
+        if status_reporter is None:
+            return
+
+        started = time.monotonic()
+        while True:
+            with anyio.move_on_after(status_interval_seconds) as scope:
+                await finished.wait()
+            if not scope.cancel_called:
+                return
+
+            elapsed = time.monotonic() - started
+            await _send_status_safely(
+                status_reporter,
+                f"Review still running after {int(elapsed)}s; waiting for the model or reviewer tools to return.",
+                min(elapsed, timeout_seconds),
+                timeout_seconds,
+            )
+
+    try:
+        with anyio.fail_after(timeout_seconds):
+            async with anyio.create_task_group() as task_group:
+                task_group.start_soon(run_review)
+                task_group.start_soon(report_heartbeat)
+    except TimeoutError:
+        timeout_label = int(timeout_seconds) if timeout_seconds.is_integer() else timeout_seconds
+        return (
+            f"Error: review timed out after {timeout_label}s before the MCP host limit. "
+            "Try narrowing focus_files, adding targeted context_files, or reducing "
+            "MAX_REVIEW_ITERATIONS / REVIEW_TOOL_TIMEOUT_SECONDS."
+        )
+
+    return result or "No review generated."
+
+
 def create_mcp(workspace_dir: str | None = None) -> FastMCP:
     """Create the MCP server with an optional default workspace."""
     default_workspace_dir = os.path.abspath(workspace_dir) if workspace_dir else None
@@ -38,6 +132,7 @@ def create_mcp(workspace_dir: str | None = None) -> FastMCP:
         task_description: str = "",
         working_directory: str | None = None,
         include_trace: bool | None = None,
+        ctx: Context = None,
     ) -> str:
         """
         Review code changes against project context using GLM.
@@ -67,7 +162,37 @@ def create_mcp(workspace_dir: str | None = None) -> FastMCP:
         # Import lazily so MCP startup stays fast and reliable in editors.
         import reviewer
 
-        return await anyio.to_thread.run_sync(
+        timeout_seconds = float(_get_tool_timeout_seconds())
+        started_at = time.monotonic()
+
+        async def report_status(
+            message: str,
+            progress: float | None = None,
+            total: float | None = None,
+        ) -> None:
+            print(f"[ReviewMCP] {message}", file=sys.stderr)
+            if ctx is None:
+                return
+
+            await ctx.info(message)
+            progress_value = progress
+            if progress_value is None:
+                progress_value = min(time.monotonic() - started_at, timeout_seconds)
+            await ctx.report_progress(
+                progress_value,
+                total=total or timeout_seconds,
+                message=message,
+            )
+
+        def report_status_from_thread(message: str) -> None:
+            anyio.from_thread.run(report_status, message, None, None)
+
+        await report_status(
+            f"Starting review in {effective_dir}.",
+            0,
+            timeout_seconds,
+        )
+        return await _run_review_with_timeout(
             lambda: reviewer.run_agentic_review(
                 working_dir=effective_dir,
                 diff_target=diff_target,
@@ -75,7 +200,10 @@ def create_mcp(workspace_dir: str | None = None) -> FastMCP:
                 focus_files=focus_files,
                 task_description=task_description,
                 include_trace=include_trace,
-            )
+                status_callback=report_status_from_thread,
+            ),
+            timeout_seconds,
+            report_status,
         )
 
     return mcp

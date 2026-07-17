@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
 from urllib.parse import unquote
 
 from dotenv import load_dotenv
@@ -44,6 +45,7 @@ EXCLUDE_PATTERNS = [
 ]
 
 MAX_ALLOWED_ITERATIONS = 50
+DEFAULT_REVIEW_MODEL = "glm-5.2"
 MAX_CONTEXT_FILES_PER_DIRECTORY = 50
 CONTEXT_DIRECTORY_SUFFIXES = {".md", ".txt", ".yaml", ".yml", ".json"}
 OPENSPEC_ROOT_FILE_ORDER = {
@@ -51,6 +53,21 @@ OPENSPEC_ROOT_FILE_ORDER = {
     "design.md": 1,
     "tasks.md": 2,
 }
+
+ReviewStatusCallback = Callable[[str], None]
+
+
+def _notify_status(
+    status_callback: ReviewStatusCallback | None,
+    message: str,
+) -> None:
+    """Send a best-effort status update to the MCP host."""
+    if status_callback is None:
+        return
+    try:
+        status_callback(message)
+    except Exception:
+        logger.debug("Status callback failed", exc_info=True)
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -182,7 +199,30 @@ def _make_client():
     )
 
 
-def get_git_diff(working_dir: str | Path, target: str = "staged") -> str:
+def _normalize_scope_files(
+    scope_files: list[str] | None,
+    working_dir: str | Path,
+) -> list[str] | None:
+    """Normalize scope files into stable git-friendly paths."""
+    if not scope_files:
+        return None
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for filepath in scope_files:
+        candidate = _path_for_git(filepath, working_dir)
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        normalized.append(candidate)
+    return normalized
+
+
+def get_git_diff(
+    working_dir: str | Path,
+    target: str = "staged",
+    scope_files: list[str] | None = None,
+) -> str:
     """Get git diff output for the requested target."""
     try:
         if target == "staged":
@@ -192,7 +232,11 @@ def get_git_diff(working_dir: str | Path, target: str = "staged") -> str:
         else:
             args = ["diff", target]
 
-        if EXCLUDE_PATTERNS:
+        normalized_scope = _normalize_scope_files(scope_files, working_dir)
+        if normalized_scope:
+            args.append("--")
+            args.extend(normalized_scope)
+        elif EXCLUDE_PATTERNS:
             args.append("--")
             args.extend(f":!{pattern}" for pattern in EXCLUDE_PATTERNS)
 
@@ -204,13 +248,27 @@ def get_git_diff(working_dir: str | Path, target: str = "staged") -> str:
         return "Error: git is not installed or not in PATH."
 
 
-def get_changed_files(working_dir: str | Path) -> list[str]:
+def get_changed_files(
+    working_dir: str | Path,
+    scope_files: list[str] | None = None,
+) -> list[str]:
     """Get the list of changed files (staged + unstaged)."""
     try:
         staged = _run_git_command(working_dir, ["diff", "--staged", "--name-only"])
         unstaged = _run_git_command(working_dir, ["diff", "--name-only"])
         files = set(staged.stdout.strip().splitlines() + unstaged.stdout.strip().splitlines())
-        return sorted(file for file in files if file)
+        changed_files = sorted(file for file in files if file)
+
+        normalized_scope = _normalize_scope_files(scope_files, working_dir)
+        if normalized_scope:
+            scope_set = set(normalized_scope)
+            changed_files = [
+                filepath
+                for filepath in changed_files
+                if _path_for_git(filepath, working_dir) in scope_set
+            ]
+
+        return changed_files
     except (subprocess.CalledProcessError, FileNotFoundError):
         return []
 
@@ -388,20 +446,29 @@ def _execute_tool(
     arguments: dict,
     *,
     working_dir: str | Path,
+    focus_files: list[str] | None = None,
 ) -> str:
     """Execute a model tool and return its result as a string."""
     if not isinstance(arguments, dict):
         arguments = {}
 
     if name == "get_uncommitted_changes":
-        return get_git_diff(working_dir, arguments.get("target", "staged"))
+        return get_git_diff(
+            working_dir,
+            arguments.get("target", "staged"),
+            scope_files=focus_files,
+        )
     if name == "read_files":
         return read_context_files(arguments.get("paths", []), working_dir)
     if name == "read_file":
         return read_context_files([arguments.get("path", "")], working_dir)
     if name == "list_changed_files":
-        files = get_changed_files(working_dir)
-        return "\n".join(files) if files else "No changed files found."
+        files = get_changed_files(working_dir, scope_files=focus_files)
+        if files:
+            return "\n".join(files)
+        if focus_files:
+            return "No changed files found within the current focus_files scope."
+        return "No changed files found."
     return f"Unknown tool: {name}"
 
 
@@ -481,6 +548,7 @@ def run_agentic_review(
     focus_files: list[str] | None = None,
     task_description: str = "",
     include_trace: bool | None = None,
+    status_callback: ReviewStatusCallback | None = None,
 ) -> str:
     """
     Run an agentic review where GLM decides what information to gather.
@@ -507,6 +575,7 @@ def run_agentic_review(
     loaded_context_files: list[str] = []
 
     logger.info("Loading context files...")
+    _notify_status(status_callback, "Loading review context files.")
     for context_entry in context_files_to_read:
         resolved_context_entry = _resolve_user_path(context_entry, repo_dir)
         expanded_context_files = expand_context_entry(context_entry, repo_dir)
@@ -540,12 +609,15 @@ def run_agentic_review(
     if focus_files:
         files_to_diff = focus_files
         logger.info("Focusing on %s specified files", len(files_to_diff))
+        _notify_status(status_callback, f"Preparing a scoped diff for {len(files_to_diff)} focus file(s).")
     elif all_diff_files:
         files_to_diff = all_diff_files
         logger.info("Found %s files in context files", len(files_to_diff))
+        _notify_status(status_callback, f"Preparing diffs for {len(files_to_diff)} file(s) referenced by context.")
     else:
         files_to_diff = None
         logger.info("No specific files - reviewer will decide")
+        _notify_status(status_callback, "No scoped diff found; the model will inspect changed files with reviewer tools.")
 
     if files_to_diff:
         diff_content = get_scoped_diff(files_to_diff, repo_dir, diff_target)
@@ -577,9 +649,18 @@ REVIEW FOCUS:
 
 Be concise but thorough. Ignore minor style issues."""
 
+    if focus_files:
+        system_prompt += (
+            "\n\nA focus_files scope is active. Keep the review centered on those files. "
+            "Use tool results within that scope for diffs and changed-file discovery, and "
+            "only read additional files when they are directly relevant dependencies."
+        )
+
     sections: list[str] = []
     if task_description:
         sections.append(f"## Task Description\n{task_description}")
+    if focus_files:
+        sections.append(f"## Focus Files\n{chr(10).join(focus_files)}")
     if context_file_content.strip():
         sections.append(f"## Context Files\n{context_file_content}")
     if changed_files:
@@ -598,12 +679,16 @@ Be concise but thorough. Ignore minor style issues."""
         {"role": "user", "content": user_message},
     ]
 
-    model_name = os.getenv("AI_MODEL") or os.getenv("ZHIPU_MODEL") or "GLM-4.7"
+    model_name = os.getenv("AI_MODEL") or os.getenv("ZHIPU_MODEL") or DEFAULT_REVIEW_MODEL
     max_iterations = _get_max_iterations()
     trace.append(f"Max review iterations: {max_iterations}")
     logger.info("Starting review...")
     logger.info("Found %s changed files", len(changed_files))
     logger.info("Loaded %s context file paths", len(loaded_context_files))
+    _notify_status(
+        status_callback,
+        f"Starting model review with {len(changed_files)} changed file(s) and {len(loaded_context_files)} context file(s).",
+    )
 
     empty_final_retry_sent = False
     for iteration in range(max_iterations):
@@ -617,6 +702,10 @@ Be concise but thorough. Ignore minor style issues."""
         logger.info("  Payload size: %s chars, %s messages", total_chars, len(messages))
         trace.append(
             f"Iteration {iteration + 1}: payload {total_chars} chars across {len(messages)} messages"
+        )
+        _notify_status(
+            status_callback,
+            f"Iteration {iteration + 1}/{max_iterations}: calling {model_name} with {len(messages)} message(s), about {total_chars} chars.",
         )
 
         backoff = 1
@@ -635,17 +724,23 @@ Be concise but thorough. Ignore minor style issues."""
                 retryable = any(code in str(exc) for code in ["500", "502", "503", "429"])
                 if retry < 2 and retryable:
                     logger.warning("  Retry %s due to %s. Waiting %ss...", retry + 1, exc, backoff)
+                    _notify_status(
+                        status_callback,
+                        f"Iteration {iteration + 1}/{max_iterations}: retryable model error; retrying in {backoff}s.",
+                    )
                     time.sleep(backoff)
                     backoff *= 2
                     continue
 
                 error_msg = f"Error calling model '{model_name}' API at iteration {iteration + 1}: {exc}"
                 logger.error(error_msg)
+                _notify_status(status_callback, error_msg)
                 if "502" in str(exc) or "500" in str(exc):
                     error_msg += "\n\nTIP: This often happens if the context is too large or the payload is complex. Try reducing the number of focus_files or context_files."
                 return _append_review_trace(error_msg, trace, trace_enabled)
 
         if response is None:
+            _notify_status(status_callback, "Model call did not return a response.")
             return _append_review_trace(
                 "Error: Model call did not return a response.",
                 trace,
@@ -658,10 +753,15 @@ Be concise but thorough. Ignore minor style issues."""
             content = _message_content_to_text(message.content)
             if content.strip():
                 trace.append(f"Review complete after {iteration + 1} iteration(s)")
+                _notify_status(status_callback, "Review complete; returning the final response.")
                 return _append_review_trace(content, trace, trace_enabled)
 
             if not empty_final_retry_sent and iteration + 1 < max_iterations:
                 empty_final_retry_sent = True
+                _notify_status(
+                    status_callback,
+                    "Model returned an empty final response; asking for the review text.",
+                )
                 trace.append(
                     f"Iteration {iteration + 1}: model returned an empty final response; requesting review text"
                 )
@@ -683,6 +783,10 @@ Be concise but thorough. Ignore minor style issues."""
         messages.append(message)
         logger.info("GLM requested %s tool(s)", len(message.tool_calls))
         trace.append(f"Iteration {iteration + 1}: model requested {len(message.tool_calls)} tool call(s)")
+        _notify_status(
+            status_callback,
+            f"Iteration {iteration + 1}/{max_iterations}: model requested {len(message.tool_calls)} reviewer tool(s).",
+        )
 
         for tool_call in message.tool_calls:
             func_name = tool_call.function.name
@@ -704,7 +808,13 @@ Be concise but thorough. Ignore minor style issues."""
                 func_args = {}
 
             logger.info("  → %s(%s)", func_name, func_args)
-            result = _execute_tool(func_name, func_args, working_dir=repo_dir)
+            _notify_status(status_callback, f"Running reviewer tool: {func_name}.")
+            result = _execute_tool(
+                func_name,
+                func_args,
+                working_dir=repo_dir,
+                focus_files=focus_files,
+            )
             trace.append(f"Tool call: {func_name} -> {len(result)} chars")
             messages.append(
                 {
@@ -714,6 +824,7 @@ Be concise but thorough. Ignore minor style issues."""
                 }
             )
 
+    _notify_status(status_callback, "Review stopped after reaching the maximum model iterations.")
     return _append_review_trace(
         "Error: Maximum iterations reached without completing review.",
         trace,
