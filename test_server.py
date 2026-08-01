@@ -3,6 +3,7 @@ import time
 from unittest import mock
 
 import anyio
+from mcp import Client
 
 import server
 
@@ -15,9 +16,9 @@ class ServerWorkspaceTests(unittest.TestCase):
 
     def test_review_requires_workspace_when_no_default_is_configured(self) -> None:
         async def call_review_without_workspace() -> str:
-            mcp = server.create_mcp()
-            _, payload = await mcp.call_tool("review_with_context", {})
-            return payload["result"]
+            async with Client(server.create_mcp()) as client:
+                result = await client.call_tool("review_with_context", {})
+                return result.structured_content["result"]
 
         result = anyio.run(call_review_without_workspace)
 
@@ -63,18 +64,22 @@ class ServerWorkspaceTests(unittest.TestCase):
         self.assertTrue(all(status[1] is not None for status in statuses))
 
     def test_review_tool_schema_does_not_expose_context(self) -> None:
-        mcp = server.create_mcp(".")
-        tool = next(tool for tool in mcp._tool_manager.list_tools() if tool.name == "review_with_context")
+        async def list_review_tool():
+            result = await server.create_mcp(".").list_tools()
+            return next(tool for tool in result if tool.name == "review_with_context")
 
-        self.assertNotIn("ctx", tool.parameters["properties"])
+        tool = anyio.run(list_review_tool)
+
+        self.assertNotIn("ctx", tool.input_schema["properties"])
 
     def test_review_with_context_returns_final_review(self) -> None:
         async def run_tool_flow() -> str:
-            mcp = server.create_mcp(".")
-            return await mcp._tool_manager.call_tool(
-                "review_with_context",
-                {"working_directory": "."},
-            )
+            async with Client(server.create_mcp(".")) as client:
+                result = await client.call_tool(
+                    "review_with_context",
+                    {"working_directory": "."},
+                )
+                return result.structured_content["result"]
 
         with mock.patch("reviewer.run_agentic_review", return_value="synthetic final review"):
             result = anyio.run(run_tool_flow)

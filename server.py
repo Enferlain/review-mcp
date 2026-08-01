@@ -9,7 +9,7 @@ import time
 from typing import Awaitable, Callable
 
 import anyio
-from mcp.server.fastmcp import Context, FastMCP
+from mcp.server.mcpserver import Context, MCPServer
 
 DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS = 1800
 
@@ -119,10 +119,10 @@ async def _run_review_with_timeout(
     return result or "No review generated."
 
 
-def create_mcp(workspace_dir: str | None = None) -> FastMCP:
+def create_mcp(workspace_dir: str | None = None) -> MCPServer:
     """Create the MCP server with an optional default workspace."""
     default_workspace_dir = os.path.abspath(workspace_dir) if workspace_dir else None
-    mcp = FastMCP(name="Code Review MCP")
+    mcp = MCPServer(name="Code Review MCP")
 
     @mcp.tool()
     async def review_with_context(
@@ -174,7 +174,6 @@ def create_mcp(workspace_dir: str | None = None) -> FastMCP:
             if ctx is None:
                 return
 
-            await ctx.info(message)
             progress_value = progress
             if progress_value is None:
                 progress_value = min(time.monotonic() - started_at, timeout_seconds)
