@@ -14,7 +14,7 @@ for base_url in base_urls:
     # Test 1: Simple Prompt
     try:
         response = client.chat.completions.create(
-            model="GLM-5.1",
+            model="glm-5.2",
             messages=[{"role": "user", "content": "hi"}],
             max_tokens=10,
             temperature=0.2,
@@ -40,7 +40,7 @@ for base_url in base_urls:
     ]
     try:
         response = client.chat.completions.create(
-            model="GLM-5.1",
+            model="glm-5.2",
             messages=[{"role": "user", "content": "weather in Paris?"}],
             tools=tools,
             temperature=0.2,

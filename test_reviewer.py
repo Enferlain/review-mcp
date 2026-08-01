@@ -25,6 +25,72 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertEqual(result, "synthetic review")
         fake_client.chat.completions.create.assert_called_once()
 
+    def test_run_agentic_review_reports_status_milestones(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_client = mock.Mock()
+            fake_message = mock.Mock()
+            fake_message.tool_calls = None
+            fake_message.content = "synthetic review"
+            fake_response = mock.Mock()
+            fake_response.choices = [mock.Mock(message=fake_message)]
+            fake_client.chat.completions.create.return_value = fake_response
+            statuses: list[str] = []
+
+            with mock.patch.dict(os.environ, {"AI_MODEL": "", "ZHIPU_MODEL": ""}, clear=False):
+                with mock.patch("reviewer._make_client", return_value=fake_client):
+                    result = reviewer.run_agentic_review(
+                        working_dir=tmpdir,
+                        status_callback=statuses.append,
+                    )
+
+        self.assertEqual(result, "synthetic review")
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args.kwargs["model"],
+            reviewer.DEFAULT_REVIEW_MODEL,
+        )
+        self.assertTrue(any("Loading review context files" in status for status in statuses))
+        self.assertTrue(any(f"calling {reviewer.DEFAULT_REVIEW_MODEL}" in status for status in statuses))
+        self.assertTrue(any("Review complete" in status for status in statuses))
+
+    def test_default_review_model_is_glm_5_2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_client = mock.Mock()
+            fake_message = mock.Mock()
+            fake_message.tool_calls = None
+            fake_message.content = "synthetic review"
+            fake_response = mock.Mock()
+            fake_response.choices = [mock.Mock(message=fake_message)]
+            fake_client.chat.completions.create.return_value = fake_response
+
+            with mock.patch.dict(os.environ, {"AI_MODEL": "", "ZHIPU_MODEL": ""}, clear=False):
+                with mock.patch("reviewer._make_client", return_value=fake_client):
+                    reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertEqual(fake_client.chat.completions.create.call_args.kwargs["model"], "glm-5.2")
+
+    def test_legacy_zhipu_model_env_still_overrides_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fake_client = mock.Mock()
+            fake_message = mock.Mock()
+            fake_message.tool_calls = None
+            fake_message.content = "synthetic review"
+            fake_response = mock.Mock()
+            fake_response.choices = [mock.Mock(message=fake_message)]
+            fake_client.chat.completions.create.return_value = fake_response
+
+            with mock.patch.dict(
+                os.environ,
+                {"AI_MODEL": "", "ZHIPU_MODEL": "legacy-env-model"},
+                clear=False,
+            ):
+                with mock.patch("reviewer._make_client", return_value=fake_client):
+                    reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args.kwargs["model"],
+            "legacy-env-model",
+        )
+
     def test_get_git_diff_builds_single_pathspec_separator(self) -> None:
         completed = mock.Mock(stdout="diff output")
 
@@ -38,11 +104,49 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertGreater(len(args), 3)
         self.assertTrue(all(part.startswith(":!") for part in args[3:]))
 
+    def test_get_git_diff_scopes_to_focus_files(self) -> None:
+        completed = mock.Mock(stdout="scoped diff")
+
+        with mock.patch("reviewer._run_git_command", return_value=completed) as run_git:
+            result = reviewer.get_git_diff(
+                ".",
+                "unstaged",
+                scope_files=["library/a.py", "./library/b.py", "library/a.py"],
+            )
+
+        self.assertEqual(result, "scoped diff")
+        args = run_git.call_args.args[1]
+        self.assertEqual(args, ["diff", "--", "library/a.py", "library/b.py"])
+
     def test_get_changed_files_handles_missing_git(self) -> None:
         with mock.patch("reviewer._run_git_command", side_effect=FileNotFoundError):
             result = reviewer.get_changed_files(".")
 
         self.assertEqual(result, [])
+
+    def test_get_changed_files_filters_to_focus_scope(self) -> None:
+        staged = mock.Mock(stdout="library/a.py\nlibrary/c.py\n")
+        unstaged = mock.Mock(stdout="library/b.py\nlibrary/c.py\n")
+
+        with mock.patch("reviewer._run_git_command", side_effect=[staged, unstaged]):
+            files = reviewer.get_changed_files(
+                ".",
+                scope_files=["library/b.py", "library/c.py", "missing.py"],
+            )
+
+        self.assertEqual(files, ["library/b.py", "library/c.py"])
+
+    def test_execute_tool_scopes_changed_files_listing(self) -> None:
+        with mock.patch("reviewer.get_changed_files", return_value=["focused.py"]) as get_changed_files:
+            result = reviewer._execute_tool(
+                "list_changed_files",
+                {},
+                working_dir=".",
+                focus_files=["focused.py"],
+            )
+
+        self.assertEqual(result, "focused.py")
+        get_changed_files.assert_called_once_with(".", scope_files=["focused.py"])
 
     def test_read_context_files_accepts_none_and_single_path(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -153,22 +257,25 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             fake_response.choices = [mock.Mock(message=fake_message)]
             fake_client.chat.completions.create.return_value = fake_response
 
-            with mock.patch.dict(os.environ, {"AI_MODEL": "GLM-5.1"}, clear=False):
+            with mock.patch.dict(os.environ, {"AI_MODEL": "custom-review-model"}, clear=False):
                 with mock.patch("reviewer._make_client", return_value=fake_client):
                     reviewer.run_agentic_review(working_dir=tmpdir)
 
-        self.assertEqual(fake_client.chat.completions.create.call_args.kwargs["model"], "GLM-5.1")
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args.kwargs["model"],
+            "custom-review-model",
+        )
 
     def test_api_error_mentions_selected_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_client = mock.Mock()
             fake_client.chat.completions.create.side_effect = RuntimeError("boom")
 
-            with mock.patch.dict(os.environ, {"AI_MODEL": "GLM-5.1"}, clear=False):
+            with mock.patch.dict(os.environ, {"AI_MODEL": "custom-review-model"}, clear=False):
                 with mock.patch("reviewer._make_client", return_value=fake_client):
                     result = reviewer.run_agentic_review(working_dir=tmpdir)
 
-        self.assertIn("Error calling model 'GLM-5.1' API", result)
+        self.assertIn("Error calling model 'custom-review-model' API", result)
 
     def test_non_dict_tool_arguments_are_ignored(self) -> None:
         result = reviewer._execute_tool("read_files", ["not", "a", "dict"], working_dir=".")

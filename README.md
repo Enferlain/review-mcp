@@ -7,8 +7,8 @@ AI-powered code review using Zhipu GLM. The server gathers git diffs and optiona
 Install dependencies:
 
 ```bash
-git clone https://github.com/Enferlain/antigravity-review-mcp.git
-cd antigravity-review-mcp
+git clone https://github.com/Enferlain/review-mcp.git
+cd review-mcp
 cp .env.example .env
 # Optional: edit .env and add your API key
 uv sync
@@ -25,7 +25,7 @@ For local development, use `uv run` from your clone:
       "command": "uv",
       "args": [
         "--directory",
-        "/absolute/path/to/antigravity-review-mcp",
+        "/absolute/path/to/review-mcp",
         "run",
         "review-mcp"
       ]
@@ -43,7 +43,7 @@ For day-to-day use from Git, `uvx` avoids hardcoding a local install path:
       "command": "uvx",
       "args": [
         "--from",
-        "git+https://github.com/Enferlain/antigravity-review-mcp",
+        "git+https://github.com/Enferlain/review-mcp",
         "review-mcp"
       ]
     }
@@ -56,7 +56,7 @@ The MCP caller should pass the repository being reviewed as `working_directory` 
 ```json
 "args": [
   "--from",
-  "git+https://github.com/Enferlain/antigravity-review-mcp",
+  "git+https://github.com/Enferlain/review-mcp",
   "review-mcp",
   "--workspace-dir",
   "/absolute/path/to/the-repo-you-want-reviewed"
@@ -70,8 +70,9 @@ Environment variables (in `.env`):
 - `AI_API_KEY` (required): Your API key
 - `ZHIPU_API_KEY` (optional): Backward-compatible fallback key name
 - `ZHIPU_BASE_URL` (optional): Override API endpoint
-- `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `GLM-4.7`)
+- `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.2`)
 - `MAX_REVIEW_ITERATIONS` (optional): Max tool-calling iterations (default: 20, capped at 50)
+- `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
 - `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
 
 ## Usage
@@ -86,6 +87,8 @@ Parameters:
 - `task_description`: Description of what you're trying to accomplish
 - `working_directory`: Git repository root to review (required unless the server was started with `--workspace-dir`)
 - `include_trace`: Include a compact diagnostic trace in the returned review (optional, defaults to `REVIEW_MCP_INCLUDE_TRACE`)
+
+While a review runs, the MCP tool emits best-effort status/progress updates for major phases such as loading context, preparing scoped diffs, calling the model, retrying transient model errors, running reviewer tools, and waiting during long model calls. MCP clients that display progress or log notifications can show those updates before the final review returns.
 
 When called, it automatically:
 
@@ -108,6 +111,8 @@ OpenSpec change folders are included only when the MCP caller passes the folder 
 
 If MCP calls feel opaque, set `include_trace` to `true` for a single call or set `REVIEW_MCP_INCLUDE_TRACE=true` in the environment. The returned review will include a compact trace with the workspace, diff target, context-file count, payload sizes, model iterations, and tool calls.
 
+Trace output is meant for debugging review behavior and can be disabled again once the setup is behaving as expected.
+
 ## Codex / VS Code Notes
 
 This server now starts cleanly under MCP hosts because it avoids doing heavy work at import time. A few setup notes still matter:
@@ -122,7 +127,7 @@ Example Windows fallback path:
 ```json
 "args": [
   "--directory",
-  "D:/Projects/antigravity-review-mcp",
+  "D:/Projects/review-mcp",
   "run",
   "review-mcp",
   "--workspace-dir",

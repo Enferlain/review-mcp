@@ -38,7 +38,7 @@ print(f"Payload size (User Message): {len(user_message)} chars")
 
 try:
     response = client.chat.completions.create(
-        model="GLM-5.1",
+        model="glm-5.2",
         messages=[
             {
                 "role": "system",
