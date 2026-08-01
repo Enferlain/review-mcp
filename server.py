@@ -9,7 +9,7 @@ import os
 import sys
 
 import anyio
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -25,10 +25,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def create_mcp(workspace_dir: str | None = None) -> FastMCP:
+def create_mcp(workspace_dir: str | None = None) -> MCPServer:
     """Create the MCP server with an optional default workspace."""
     default_workspace_dir = os.path.abspath(workspace_dir) if workspace_dir else None
-    mcp = FastMCP(name="Code Review MCP")
+    mcp = MCPServer(name="Code Review MCP")
 
     @mcp.tool()
     async def review_with_context(
