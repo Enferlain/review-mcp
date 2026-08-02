@@ -8,6 +8,21 @@ import reviewer
 
 
 class RunAgenticReviewEnvTests(unittest.TestCase):
+    def test_make_client_uses_900_second_api_timeout_by_default(self) -> None:
+        with mock.patch.dict(os.environ, {"AI_API_KEY": "test-key"}, clear=True):
+            with mock.patch("openai.OpenAI") as openai_client:
+                reviewer._make_client()
+
+        self.assertEqual(openai_client.call_args.kwargs["timeout"], 900.0)
+
+    def test_model_api_timeout_can_be_overridden(self) -> None:
+        with mock.patch.dict(os.environ, {"AI_API_TIMEOUT_SECONDS": "1200"}, clear=False):
+            self.assertEqual(reviewer._get_model_api_timeout_seconds(), 1200.0)
+
+    def test_invalid_model_api_timeout_falls_back_to_default(self) -> None:
+        with mock.patch.dict(os.environ, {"AI_API_TIMEOUT_SECONDS": "invalid"}, clear=False):
+            self.assertEqual(reviewer._get_model_api_timeout_seconds(), 900.0)
+
     def test_invalid_max_review_iterations_falls_back_to_default(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_client = mock.Mock()

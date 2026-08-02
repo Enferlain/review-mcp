@@ -46,6 +46,7 @@ EXCLUDE_PATTERNS = [
 
 MAX_ALLOWED_ITERATIONS = 50
 DEFAULT_REVIEW_MODEL = "glm-5.2"
+DEFAULT_MODEL_API_TIMEOUT_SECONDS = 900.0
 MAX_CONTEXT_FILES_PER_DIRECTORY = 50
 CONTEXT_DIRECTORY_SUFFIXES = {".md", ".txt", ".yaml", ".yml", ".json"}
 OPENSPEC_ROOT_FILE_ORDER = {
@@ -97,6 +98,31 @@ def _get_max_iterations() -> int:
             MAX_ALLOWED_ITERATIONS,
         )
         return MAX_ALLOWED_ITERATIONS
+    return value
+
+
+def _get_model_api_timeout_seconds() -> float:
+    """Return the timeout for each model API request."""
+    raw_value = os.getenv(
+        "AI_API_TIMEOUT_SECONDS",
+        str(DEFAULT_MODEL_API_TIMEOUT_SECONDS),
+    )
+    try:
+        value = float(raw_value)
+    except ValueError:
+        logger.warning(
+            "Invalid AI_API_TIMEOUT_SECONDS=%r; defaulting to %s",
+            raw_value,
+            DEFAULT_MODEL_API_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_MODEL_API_TIMEOUT_SECONDS
+
+    if value < 1:
+        logger.warning(
+            "AI_API_TIMEOUT_SECONDS must be >= 1; defaulting to %s",
+            DEFAULT_MODEL_API_TIMEOUT_SECONDS,
+        )
+        return DEFAULT_MODEL_API_TIMEOUT_SECONDS
     return value
 
 
@@ -195,7 +221,7 @@ def _make_client():
     return OpenAI(
         api_key=api_key,
         base_url=base_url,
-        timeout=120.0,
+        timeout=_get_model_api_timeout_seconds(),
     )
 
 
