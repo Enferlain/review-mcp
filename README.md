@@ -73,6 +73,8 @@ Environment variables (in `.env`):
 - `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.2`)
 - `AI_API_TIMEOUT_SECONDS` (optional): Timeout for each model API request (default: 900)
 - `MAX_REVIEW_ITERATIONS` (optional): Max tool-calling iterations (default: 20, capped at 50)
+- `MAX_REVIEW_CONTEXT_CHARS` (optional): Hard ceiling for accumulated model context (default: 90000)
+- `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 20000)
 - `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
 - `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
 
@@ -97,8 +99,10 @@ When called, it automatically:
 2. Expands explicitly provided OpenSpec change folders into their context files
 3. Resolves `render_diffs()` and `file:///` links inside those context files
 4. Includes an initial scoped diff when `focus_files` or context-file `render_diffs()` links identify files
-5. Lets GLM gather additional diffs or files as needed using its tools
-6. Returns the final review
+5. Lets GLM inspect a bounded repository tree, search with ripgrep, and read targeted line ranges
+6. Lets GLM request repository-wide staged and unstaged diffs even when `focus_files` is active
+7. Deduplicates repeated requests/results and enforces cumulative and per-tool context budgets
+8. Returns the final review
 
 OpenSpec change folders are included only when the MCP caller passes the folder path in `context_files`, for example:
 
@@ -142,4 +146,4 @@ Example prompt to your AI assistant:
 
 ## Security Note
 
-The reviewer agent can read any file accessible from the working directory. This is by design for comprehensive reviews, but be aware of this when using in sensitive environments.
+Model-requested tree, search, and file-read tools are confined to the selected repository root, including protection against `..` and symlink escapes. Explicit caller-provided `context_files` may still reference readable files outside the repository, so use those deliberately in sensitive environments.
