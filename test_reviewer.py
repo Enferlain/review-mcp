@@ -29,6 +29,108 @@ def _model_response(message: SimpleNamespace) -> SimpleNamespace:
 
 
 class RunAgenticReviewEnvTests(unittest.TestCase):
+    def test_model_requests_use_streaming_transport(self) -> None:
+        fake_message = SimpleNamespace(content="review", tool_calls=None)
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.return_value = _model_response(fake_message)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("reviewer._make_client", return_value=fake_client):
+                self.assertEqual(
+                    reviewer.run_agentic_review(working_dir=tmpdir),
+                    "review",
+                )
+
+        self.assertIs(
+            fake_client.chat.completions.create.call_args.kwargs["stream"],
+            True,
+        )
+
+    def test_streaming_completion_reassembles_fragmented_tool_calls(self) -> None:
+        def chunk(*, content=None, tool_calls=None, finish_reason=None):
+            return SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        finish_reason=finish_reason,
+                        delta=SimpleNamespace(
+                            content=content,
+                            tool_calls=tool_calls,
+                        ),
+                    )
+                ]
+            )
+
+        def tool_delta(index, *, call_id=None, name=None, arguments=None):
+            function = None
+            if name is not None or arguments is not None:
+                function = SimpleNamespace(name=name, arguments=arguments)
+            return SimpleNamespace(index=index, id=call_id, function=function)
+
+        stream = mock.Mock()
+        stream.__iter__ = mock.Mock(
+            return_value=iter(
+                [
+                    SimpleNamespace(
+                        choices=[
+                            SimpleNamespace(finish_reason=None, delta=None)
+                        ]
+                    ),
+                    chunk(
+                        content="working ",
+                        tool_calls=[tool_delta(0, call_id="call-", name="read_")],
+                    ),
+                    chunk(
+                        content="now",
+                        tool_calls=[
+                            tool_delta(0, call_id="1", name="file", arguments='{\"path\":')
+                        ]
+                    ),
+                    chunk(
+                        tool_calls=[tool_delta(0, arguments='\"reviewer.py\"}')],
+                        finish_reason="tool_calls",
+                    ),
+                ]
+            )
+        )
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.return_value = stream
+
+        response = reviewer._create_streaming_chat_completion(
+            fake_client,
+            model="test-model",
+            messages=[],
+        )
+
+        message = response.choices[0].message
+        self.assertEqual(message.content, "working now")
+        self.assertEqual(message.tool_calls[0].id, "call-1")
+        self.assertEqual(message.tool_calls[0].function.name, "read_file")
+        self.assertEqual(
+            message.tool_calls[0].function.arguments,
+            '{\"path\":\"reviewer.py\"}',
+        )
+        self.assertEqual(response.choices[0].finish_reason, "tool_calls")
+        stream.close.assert_called_once_with()
+
+    def test_streaming_completion_accepts_complete_compatible_response(self) -> None:
+        complete_response = _model_response(
+            SimpleNamespace(content="complete", tool_calls=None)
+        )
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.return_value = complete_response
+
+        response = reviewer._create_streaming_chat_completion(
+            fake_client,
+            model="test-model",
+            messages=[],
+        )
+
+        self.assertIs(response, complete_response)
+        self.assertIs(
+            fake_client.chat.completions.create.call_args.kwargs["stream"],
+            True,
+        )
+
     def test_make_client_uses_900_second_api_timeout_by_default(self) -> None:
         with mock.patch.dict(os.environ, {"AI_API_KEY": "test-key"}, clear=True):
             with mock.patch("openai.OpenAI") as openai_client:
