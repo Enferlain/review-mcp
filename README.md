@@ -73,10 +73,12 @@ Environment variables (in `.env`):
 - `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.2`)
 - `AI_API_TIMEOUT_SECONDS` (optional): Timeout for each model API request (default: 900)
 - `MAX_REVIEW_ITERATIONS` (optional): Max tool-calling iterations (default: 20, capped at 50)
-- `MAX_REVIEW_CONTEXT_CHARS` (optional): Hard ceiling for accumulated model context (default: 90000)
-- `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 20000)
+- `MAX_REVIEW_CONTEXT_CHARS` (optional): Hard ceiling for accumulated model context (default: 45000). This is deliberately below the model's nominal context size because large tool-loop payloads can time out.
+- `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 8000)
 - `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
 - `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
+
+Model-requested file reads default to 120 lines and are capped at 200 lines; use repository search to locate the relevant range first.
 
 ## Usage
 

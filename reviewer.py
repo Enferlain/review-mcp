@@ -49,10 +49,13 @@ EXCLUDE_PATTERNS = [
 MAX_ALLOWED_ITERATIONS = 50
 DEFAULT_REVIEW_MODEL = "glm-5.2"
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 900.0
-DEFAULT_MAX_REVIEW_CONTEXT_CHARS = 90000
-DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
-DEFAULT_READ_FILE_LINES = 200
-MAX_READ_FILE_LINES = 400
+# GLM-5.2 becomes unreliable well before its advertised context window when a
+# tool loop accumulates large source excerpts. Keep the default working set
+# small enough that a final response is still practical after several reads.
+DEFAULT_MAX_REVIEW_CONTEXT_CHARS = 45000
+DEFAULT_MAX_TOOL_RESULT_CHARS = 8000
+DEFAULT_READ_FILE_LINES = 120
+MAX_READ_FILE_LINES = 200
 MAX_READ_LINE_CHARS = 2000
 DEFAULT_TREE_ENTRIES = 200
 MAX_TREE_ENTRIES = 500
@@ -957,7 +960,7 @@ REVIEWER_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a targeted, line-numbered range from one repository file. Results are capped at 400 lines.",
+            "description": "Read a targeted, line-numbered range from one repository file. Results are capped at 200 lines.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -972,7 +975,7 @@ REVIEWER_TOOLS = [
                     },
                     "end_line": {
                         "type": "integer",
-                        "description": "Last line to return (inclusive); defaults to 200 lines after start_line",
+                        "description": "Last line to return (inclusive); defaults to 120 lines after start_line (hard cap 200)",
                     },
                 },
                 "required": ["path"],
@@ -1189,7 +1192,9 @@ Your job is to review code changes. You have access to these tools:
 The user will provide you with context about what to review. Use your tools
 to gather only the additional information you need. Inspect the tree or search before
 reading unfamiliar files, request narrow line ranges, and do not request content that
-is already present in the prompt or a previous tool result.
+is already present in the prompt or a previous tool result. Do not read a whole large
+file in consecutive chunks: use search to locate the relevant functions, then read
+only those ranges. Return the review once you have enough evidence.
 
 REVIEW FOCUS:
 1. Does the code match the stated intent (if provided)?
