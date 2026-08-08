@@ -50,12 +50,10 @@ GLM_5_2_REASONING_EFFORTS = {
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 900.0
 GLM_5_2_CONTEXT_WINDOW_TOKENS = 1_000_000
 GLM_5_2_MAX_OUTPUT_TOKENS = 131_072
-# Z.AI defines the context window as input plus generated output. review-mcp
-# reserves the model's full output allowance and uses one character per token as
-# a conservative, dependency-free source-code proxy for the remaining input.
-DEFAULT_MAX_REVIEW_CONTEXT_CHARS = (
-    GLM_5_2_CONTEXT_WINDOW_TOKENS - GLM_5_2_MAX_OUTPUT_TOKENS
-)
+# Character counts are not model token counts. Keep this name as a compatibility
+# export for callers that imported it, but do not apply a model-derived default.
+# The provider's completion usage is the authoritative context measurement.
+DEFAULT_MAX_REVIEW_CONTEXT_CHARS: int | None = None
 DEFAULT_MAX_TOOL_RESULT_CHARS = 20000
 DEFAULT_READ_FILE_LINES = 200
 MAX_READ_FILE_LINES = 400
@@ -157,6 +155,28 @@ def _get_positive_int_env(name: str, default: int, *, minimum: int = 1) -> int:
     if value < minimum:
         logger.warning("%s must be >= %s; defaulting to %s", name, minimum, default)
         return default
+    return value
+
+
+def _get_optional_positive_int_env(
+    name: str,
+    *,
+    minimum: int = 1,
+) -> int | None:
+    """Return an explicit positive integer setting, or ``None`` when unset."""
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; ignoring optional setting", name, raw_value)
+        return None
+    if value < minimum:
+        logger.warning(
+            "%s must be >= %s; ignoring optional setting", name, minimum
+        )
+        return None
     return value
 
 

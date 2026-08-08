@@ -298,8 +298,108 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
 
         self.assertEqual(openai_client.call_args.kwargs["timeout"], 900.0)
 
-    def test_default_context_budget_reserves_glm_5_2_maximum_output(self) -> None:
-        self.assertEqual(reviewer.DEFAULT_MAX_REVIEW_CONTEXT_CHARS, 868_928)
+    def test_default_context_budget_does_not_fake_a_token_count_with_chars(self) -> None:
+        self.assertIsNone(reviewer.DEFAULT_MAX_REVIEW_CONTEXT_CHARS)
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(
+                reviewer._get_optional_positive_int_env(
+                    "MAX_REVIEW_CONTEXT_CHARS",
+                    minimum=10000,
+                )
+            )
+
+    def test_context_character_safety_override_is_explicit(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"MAX_REVIEW_CONTEXT_CHARS": "12000"},
+            clear=True,
+        ):
+            self.assertEqual(
+                reviewer._get_optional_positive_int_env(
+                    "MAX_REVIEW_CONTEXT_CHARS",
+                    minimum=10000,
+                ),
+                12000,
+            )
+
+    def test_default_review_does_not_truncate_context_by_character_count(self) -> None:
+        fake_message = SimpleNamespace(content="final review", tool_calls=None)
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.return_value = _model_response(fake_message)
+        context_text = "context-start\n" + ("x" * 12000) + "\ncontext-end"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            context_path = Path(tmpdir, "context.md")
+            context_path.write_text(context_text, encoding="utf-8")
+            with (
+                mock.patch.dict(os.environ, {}, clear=True),
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+            ):
+                result = reviewer.run_agentic_review(
+                    working_dir=tmpdir,
+                    context_files=[str(context_path)],
+                )
+
+        self.assertEqual(result, "final review")
+        user_message = fake_client.chat.completions.create.call_args.kwargs[
+            "messages"
+        ][1]["content"]
+        self.assertIn("context-end", user_message)
+
+    def test_provider_prompt_usage_forces_final_when_model_window_is_reached(
+        self,
+    ) -> None:
+        tool_message = _tool_message("list_repository_tree", {})
+        final_message = SimpleNamespace(content="final review", tool_calls=None)
+        first_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=tool_message)],
+            usage=SimpleNamespace(
+                prompt_tokens=(
+                    reviewer.GLM_5_2_CONTEXT_WINDOW_TOKENS
+                    - reviewer.GLM_5_2_MAX_OUTPUT_TOKENS
+                    + 1
+                ),
+                completion_tokens=100,
+            ),
+        )
+        second_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=final_message)],
+            usage=SimpleNamespace(prompt_tokens=900_000, completion_tokens=100),
+        )
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.side_effect = [
+            first_response,
+            second_response,
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"MAX_REVIEW_ITERATIONS": "2"},
+                    clear=True,
+                ),
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+                mock.patch(
+                    "review_mcp.review._execute_tool",
+                    return_value="small result",
+                ) as execute_tool,
+            ):
+                result = reviewer.run_agentic_review(
+                    working_dir=tmpdir,
+                    include_trace=True,
+                )
+
+        self.assertIn("final review", result)
+        self.assertIn("API usage", result)
+        self.assertIn("Model token budget reached", result)
+        execute_tool.assert_not_called()
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args_list[1].kwargs[
+                "tool_choice"
+            ],
+            "none",
+        )
 
     def test_model_api_timeout_can_be_overridden(self) -> None:
         with mock.patch.dict(

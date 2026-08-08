@@ -74,7 +74,7 @@ Environment variables (in `.env`):
 - `AI_REASONING_EFFORT` / `ZHIPU_REASONING_EFFORT` (optional): GLM-5.2 reasoning effort (default: `high`; only sent for `glm-5.2`)
 - `AI_API_TIMEOUT_SECONDS` (optional): Timeout for each model API request (default: 900)
 - `MAX_REVIEW_ITERATIONS` (optional): Max tool-calling iterations (default: 20, capped at 50)
-- `MAX_REVIEW_CONTEXT_CHARS` (optional): Accumulated input ceiling (default: `868928` characters—a conservative dependency-free proxy for GLM-5.2's 1M-token total window after reserving its 131072-token maximum output)
+- `MAX_REVIEW_CONTEXT_CHARS` (optional): Explicit character-based safety ceiling for the accumulated request. Unset by default; character counts are not used as a proxy for model tokens. The completion API's `usage.prompt_tokens` is the authoritative context measurement, and GLM-5.2 enforces its own model window.
 - `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 20000)
 - `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
 - `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
@@ -102,7 +102,7 @@ When called, it automatically:
 4. Includes an initial scoped diff when `focus_files` or context-file `render_diffs()` links identify files
 5. Lets GLM inspect a bounded repository tree, search with ripgrep, and read targeted line ranges
 6. Lets GLM request repository-wide staged and unstaged diffs even when `focus_files` is active
-7. Deduplicates repeated requests/results and enforces cumulative and per-tool context budgets
+7. Deduplicates repeated requests/results, records provider-reported token usage, and enforces the optional character safety ceiling plus per-tool result limits
 8. Returns the final review
 
 OpenSpec change folders are included only when the MCP caller passes the folder path in `context_files`, for example:

@@ -11,12 +11,14 @@ from pathlib import Path
 
 from review_mcp import repository
 from review_mcp.config import (
-    DEFAULT_MAX_REVIEW_CONTEXT_CHARS,
     DEFAULT_MAX_TOOL_RESULT_CHARS,
     DEFAULT_REVIEW_MODEL,
+    GLM_5_2_CONTEXT_WINDOW_TOKENS,
+    GLM_5_2_MAX_OUTPUT_TOKENS,
     _env_flag,
     _get_glm_5_2_reasoning_effort,
     _get_max_iterations,
+    _get_optional_positive_int_env,
     _get_positive_int_env,
     logger,
 )
@@ -233,9 +235,10 @@ Be concise but thorough. Ignore minor style issues."""
             "the whole repository. Only inspect additional files when directly relevant."
         )
 
-    max_context_chars = _get_positive_int_env(
+    # This is an optional operational safety valve only. It is deliberately
+    # not derived from the model's token window: characters are not tokens.
+    max_context_chars = _get_optional_positive_int_env(
         "MAX_REVIEW_CONTEXT_CHARS",
-        DEFAULT_MAX_REVIEW_CONTEXT_CHARS,
         minimum=10000,
     )
     max_tool_result_chars = _get_positive_int_env(
@@ -243,7 +246,12 @@ Be concise but thorough. Ignore minor style issues."""
         DEFAULT_MAX_TOOL_RESULT_CHARS,
         minimum=1000,
     )
-    trace.append(f"Max review context: {max_context_chars} chars")
+    if max_context_chars is None:
+        trace.append(
+            "Max review context: provider token window (no character safety override)"
+        )
+    else:
+        trace.append(f"Max review context safety override: {max_context_chars} chars")
     trace.append(f"Max tool result: {max_tool_result_chars} chars")
 
     sections: list[str] = []
@@ -261,39 +269,53 @@ Be concise but thorough. Ignore minor style issues."""
     if changed_files:
         sections.append(f"## Files to Review\n{chr(10).join(changed_files)}")
 
-    fixed_size = len(system_prompt) + sum(len(section) for section in sections) + 5000
-    variable_budget = max(1000, max_context_chars - fixed_size)
-    context_budget = 0
-    diff_budget = 0
-    if context_file_content.strip() and diff_content.strip():
-        context_budget = min(len(context_file_content), variable_budget // 3)
-        diff_budget = min(len(diff_content), variable_budget - context_budget)
-        unused = variable_budget - context_budget - diff_budget
-        context_budget += min(unused, len(context_file_content) - context_budget)
-        unused = variable_budget - context_budget - diff_budget
-        diff_budget += min(unused, len(diff_content) - diff_budget)
-    elif context_file_content.strip():
-        context_budget = variable_budget
-    elif diff_content.strip():
-        diff_budget = variable_budget
-
-    initial_supplied_contents: list[str] = []
-    if context_budget:
-        bounded_context, context_truncated = _truncate_content(
-            context_file_content,
-            context_budget,
-            "INITIAL CONTEXT",
+    context_budget: int | None = None
+    diff_budget: int | None = None
+    if max_context_chars is not None:
+        fixed_size = (
+            len(system_prompt) + sum(len(section) for section in sections) + 5000
         )
+        variable_budget = max(1000, max_context_chars - fixed_size)
+        context_budget = 0
+        diff_budget = 0
+        if context_file_content.strip() and diff_content.strip():
+            context_budget = min(len(context_file_content), variable_budget // 3)
+            diff_budget = min(len(diff_content), variable_budget - context_budget)
+            unused = variable_budget - context_budget - diff_budget
+            context_budget += min(unused, len(context_file_content) - context_budget)
+            unused = variable_budget - context_budget - diff_budget
+            diff_budget += min(unused, len(diff_content) - diff_budget)
+        elif context_file_content.strip():
+            context_budget = variable_budget
+        elif diff_content.strip():
+            diff_budget = variable_budget
+    initial_supplied_contents: list[str] = []
+    if context_file_content.strip():
+        if max_context_chars is None:
+            # No default character cap: include all caller-supplied context.
+            # The provider's token usage is the authoritative measurement.
+            bounded_context = context_file_content
+            context_truncated = False
+        else:
+            bounded_context, context_truncated = _truncate_content(
+                context_file_content,
+                context_budget or 0,
+                "INITIAL CONTEXT",
+            )
         sections.append(f"## Context Files\n{bounded_context}")
         initial_supplied_contents.append(bounded_context)
         if context_truncated:
             trace.append("Initial context files truncated to fit review context budget")
-    if diff_budget:
-        bounded_diff, diff_truncated = _truncate_content(
-            diff_content,
-            diff_budget,
-            "INITIAL DIFF",
-        )
+    if diff_content.strip():
+        if max_context_chars is None:
+            bounded_diff = diff_content
+            diff_truncated = False
+        else:
+            bounded_diff, diff_truncated = _truncate_content(
+                diff_content,
+                diff_budget or 0,
+                "INITIAL DIFF",
+            )
         sections.append(f"## Git Diff ({diff_target})\n```diff\n{bounded_diff}\n```")
         initial_supplied_contents.append(bounded_diff)
         if diff_truncated:
@@ -305,16 +327,17 @@ Be concise but thorough. Ignore minor style issues."""
     else:
         user_message = "Please review the current code changes. Use list_changed_files and get_uncommitted_changes to see what's been modified."
 
-    user_message_limit = max(500, max_context_chars - len(system_prompt))
-    user_message, initial_prompt_truncated = _truncate_content(
-        user_message,
-        user_message_limit,
-        "INITIAL PROMPT",
-    )
-    if initial_prompt_truncated:
-        trace.append(
-            "Assembled initial prompt hard-truncated to review context ceiling"
+    if max_context_chars is not None:
+        user_message_limit = max(500, max_context_chars - len(system_prompt))
+        user_message, initial_prompt_truncated = _truncate_content(
+            user_message,
+            user_message_limit,
+            "INITIAL PROMPT",
         )
+        if initial_prompt_truncated:
+            trace.append(
+                "Assembled initial prompt hard-truncated to explicit character safety override"
+            )
 
     messages: list[dict | object] = [
         {"role": "system", "content": system_prompt},
@@ -323,6 +346,11 @@ Be concise but thorough. Ignore minor style issues."""
 
     model_name = (
         os.getenv("AI_MODEL") or os.getenv("ZHIPU_MODEL") or DEFAULT_REVIEW_MODEL
+    )
+    model_context_window_tokens = (
+        GLM_5_2_CONTEXT_WINDOW_TOKENS
+        if model_name.strip().lower() == "glm-5.2"
+        else None
     )
     glm_5_2_reasoning_effort = (
         _get_glm_5_2_reasoning_effort()
@@ -441,11 +469,25 @@ Be concise but thorough. Ignore minor style issues."""
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)
         completion_tokens = getattr(usage, "completion_tokens", None)
-        if prompt_tokens is not None:
+        if isinstance(prompt_tokens, int):
             usage_trace = f"Iteration {iteration + 1}: API usage {prompt_tokens} prompt tokens"
-            if completion_tokens is not None:
+            if isinstance(completion_tokens, int):
                 usage_trace += f", {completion_tokens} completion tokens"
             trace.append(usage_trace)
+            if model_context_window_tokens is not None:
+                remaining_input_tokens = (
+                    model_context_window_tokens
+                    - prompt_tokens
+                    - GLM_5_2_MAX_OUTPUT_TOKENS
+                )
+                trace.append(
+                    f"Iteration {iteration + 1}: {max(0, remaining_input_tokens)} input tokens remain after reserving the model output allowance"
+                )
+                if remaining_input_tokens <= 0 and not final_iteration:
+                    force_final_response = True
+                    trace.append(
+                        "Model token budget reached; forcing final response on the next iteration"
+                    )
         if not message.tool_calls:
             content = _message_content_to_text(message.content)
             if content.strip():
@@ -540,7 +582,7 @@ Be concise but thorough. Ignore minor style issues."""
                 result = "This exact tool request was already completed. Use the previous result or request a narrower, different range."
                 trace.append(f"Tool call deduplicated: {func_name}")
             elif force_final_response:
-                result = "The review context budget is exhausted. Produce the final review from the information already gathered."
+                result = "The model context budget has been reached. Produce the final review from the information already gathered."
             else:
                 seen_tool_calls.add(tool_key)
                 try:
@@ -559,17 +601,20 @@ Be concise but thorough. Ignore minor style issues."""
                     trace.append(f"Tool result deduplicated: {func_name}")
                 else:
                     seen_result_digests.add(result_digest)
-                    remaining_context = max_context_chars - _messages_size_chars(
-                        messages
-                    ) - tool_schema_chars
-                    result_limit = min(
-                        max_tool_result_chars, max(0, remaining_context - 200)
-                    )
+                    if max_context_chars is None:
+                        result_limit = max_tool_result_chars
+                    else:
+                        remaining_context = max_context_chars - _messages_size_chars(
+                            messages
+                        ) - tool_schema_chars
+                        result_limit = min(
+                            max_tool_result_chars, max(0, remaining_context - 200)
+                        )
                     if result_limit < 200:
-                        result = "The review context budget is exhausted. Produce the final review from the information already gathered."
+                        result = "The review context safety override is exhausted. Produce the final review from the information already gathered."
                         force_final_response = True
                         trace.append(
-                            "Review context budget exhausted; forcing final response"
+                            "Explicit character safety override exhausted; forcing final response"
                         )
                     else:
                         result, result_truncated = _truncate_content(
