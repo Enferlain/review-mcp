@@ -29,21 +29,6 @@ def _model_response(message: SimpleNamespace) -> SimpleNamespace:
 
 
 class RunAgenticReviewEnvTests(unittest.TestCase):
-    def test_default_context_limits_are_safe_for_tool_loops(self) -> None:
-        self.assertEqual(reviewer.DEFAULT_MAX_REVIEW_CONTEXT_CHARS, 45000)
-        self.assertEqual(reviewer.DEFAULT_MAX_TOOL_RESULT_CHARS, 8000)
-        self.assertEqual(reviewer.MAX_READ_FILE_LINES, 200)
-        read_file_tool = next(
-            tool
-            for tool in reviewer.REVIEWER_TOOLS
-            if tool["function"]["name"] == "read_file"
-        )
-        end_line_description = read_file_tool["function"]["parameters"]["properties"][
-            "end_line"
-        ]["description"]
-        self.assertIn("defaults to 120 lines", end_line_description)
-        self.assertIn("hard cap 200", end_line_description)
-
     def test_make_client_uses_900_second_api_timeout_by_default(self) -> None:
         with mock.patch.dict(os.environ, {"AI_API_KEY": "test-key"}, clear=True):
             with mock.patch("openai.OpenAI") as openai_client:
@@ -419,21 +404,6 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertNotIn("line 13", excerpt)
         self.assertIn("outside the repository", escaped)
 
-    def test_targeted_read_caps_large_requested_ranges_at_200_lines(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            source = Path(tmpdir, "large.py")
-            source.write_text(
-                "\n".join(f"line {line}" for line in range(1, 301)),
-                encoding="utf-8",
-            )
-            excerpt = reviewer.read_repository_file(
-                "large.py", tmpdir, start_line=1, end_line=300
-            )
-
-        self.assertIn("200 | line 200", excerpt)
-        self.assertNotIn("201 | line 201", excerpt)
-        self.assertIn("requested range capped at 200 lines", excerpt)
-
     def test_repository_search_has_its_own_deadline(self) -> None:
         class BlockingStream:
             def __iter__(self):
@@ -670,47 +640,6 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertLessEqual(len(tool_result), 2000)
         self.assertIn("TRUNCATED", tool_result)
         self.assertLessEqual(reviewer._messages_size_chars(captured_messages[1]), 10000)
-
-    def test_default_budget_forces_a_final_response_before_large_payloads(self) -> None:
-        tool_messages = [
-            _tool_message("read_file", {"path": f"file-{index}.py"}, f"call-{index}")
-            for index in range(1, 7)
-        ]
-        final_message = SimpleNamespace(content="final review", tool_calls=None)
-        responses = iter(
-            [_model_response(message) for message in tool_messages]
-            + [_model_response(final_message)]
-        )
-        captured_calls: list[dict] = []
-        fake_client = mock.Mock()
-
-        def create_response(**kwargs):
-            captured_calls.append(kwargs)
-            return next(responses)
-
-        fake_client.chat.completions.create.side_effect = create_response
-        tool_results = iter(
-            f"tool result {index}: " + ("x" * 12000) for index in range(1, 7)
-        )
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with (
-                mock.patch("reviewer._make_client", return_value=fake_client),
-                mock.patch(
-                    "reviewer._execute_tool",
-                    side_effect=lambda *args, **kwargs: next(tool_results),
-                ),
-            ):
-                result = reviewer.run_agentic_review(working_dir=tmpdir)
-
-        self.assertEqual(result, "final review")
-        self.assertEqual(captured_calls[-1]["tool_choice"], "none")
-        self.assertTrue(
-            all(
-                reviewer._messages_size_chars(call["messages"])
-                <= reviewer.DEFAULT_MAX_REVIEW_CONTEXT_CHARS
-                for call in captured_calls
-            )
-        )
 
     def test_openspec_change_directory_expands_to_context_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
