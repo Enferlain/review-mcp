@@ -71,9 +71,10 @@ Environment variables (in `.env`):
 - `ZHIPU_API_KEY` (optional): Backward-compatible fallback key name
 - `ZHIPU_BASE_URL` (optional): Override API endpoint
 - `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.2`)
+- `AI_REASONING_EFFORT` / `ZHIPU_REASONING_EFFORT` (optional): GLM-5.2 reasoning effort (default: `high`; only sent for `glm-5.2`)
 - `AI_API_TIMEOUT_SECONDS` (optional): Timeout for each model API request (default: 900)
 - `MAX_REVIEW_ITERATIONS` (optional): Max tool-calling iterations (default: 20, capped at 50)
-- `MAX_REVIEW_CONTEXT_CHARS` (optional): Hard ceiling for accumulated model context (default: 90000)
+- `MAX_REVIEW_CONTEXT_CHARS` (optional): Accumulated input ceiling (default: `868928` characters—a conservative dependency-free proxy for GLM-5.2's 1M-token total window after reserving its 131072-token maximum output)
 - `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 20000)
 - `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
 - `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
