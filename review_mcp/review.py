@@ -46,7 +46,13 @@ _PSEUDO_TOOL_TAG_RE = re.compile(
 _PSEUDO_TOOL_INTENT_RE = re.compile(
     r"\b(?:let\s+me|i\s*(?:['’]ll|will|need\s+to)|"
     r"(?:first|next),?\s+i\s*(?:['’]ll|will|need\s+to)?)\s+"
-    r"(?:call|read|inspect|search|check|look(?:\s+at)?|open|run)\b",
+    r"(?:call|read|inspect|review|search|check|look(?:\s+at)?|open|run)\b",
+    re.IGNORECASE,
+)
+_PSEUDO_TOOL_PREFIX_RE = re.compile(
+    r"^\s*(?:i\s+need\s+to\s+(?:verify|check|inspect|read|search|look(?:\s+at)?)|"
+    r"let\s+me\s+(?:make\s+(?:focused\s+)?calls?|call|verify|check|inspect|review|read|search|"
+    r"look(?:\s+at)?|open|run))\b",
     re.IGNORECASE,
 )
 _PSEUDO_TOOL_RESOLUTION_RE = re.compile(
@@ -68,6 +74,12 @@ def _looks_like_unfinished_pseudo_tool_response(content: str) -> bool:
     if not normalized:
         return False
     if _PSEUDO_TOOL_TAG_RE.search(normalized):
+        return True
+    if (
+        len(normalized) < 500
+        and _PSEUDO_TOOL_PREFIX_RE.search(normalized)
+        and not _PSEUDO_TOOL_RESOLUTION_RE.search(normalized)
+    ):
         return True
     intent_matches = list(_PSEUDO_TOOL_INTENT_RE.finditer(normalized))
     if not intent_matches:
@@ -200,10 +212,6 @@ def run_agentic_review(
         diff_content = ""
         changed_files = []
     trace.append(f"Files selected for initial diff: {len(changed_files)}")
-    if diff_content:
-        trace.append(f"Initial diff size: {len(diff_content)} chars")
-    else:
-        trace.append("Initial diff size: 0 chars")
 
     system_prompt = """You are a Senior Code Reviewer with access to tools.
 
@@ -382,18 +390,26 @@ Be concise but thorough. Ignore minor style issues."""
     }
     tool_schema_chars = len(json.dumps(REVIEWER_TOOLS, ensure_ascii=False))
     force_final_response = False
+    previous_prompt_tokens: int | None = None
+    synthesis_iterations = min(2, max(0, max_iterations - 1))
+    final_synthesis_start = max_iterations - synthesis_iterations
     for iteration in range(max_iterations):
         final_iteration = iteration + 1 == max_iterations
+        final_synthesis_iteration = iteration >= final_synthesis_start
         logger.info("Iteration %s: Calling GLM...", iteration + 1)
-        total_chars = _messages_size_chars(messages) + tool_schema_chars
-        logger.info("  Payload size: %s chars, %s messages", total_chars, len(messages))
-        trace.append(
-            f"Iteration {iteration + 1}: payload {total_chars} chars across {len(messages)} messages"
+        serialized_payload_chars = _messages_size_chars(messages) + tool_schema_chars
+        logger.debug(
+            "Payload size: %s chars across %s messages",
+            serialized_payload_chars,
+            len(messages),
         )
-        _notify_status(
-            status_callback,
-            f"Iteration {iteration + 1}/{max_iterations}: calling {model_name} with {len(messages)} message(s), about {total_chars} chars.",
+        status_message = (
+            f"Iteration {iteration + 1}/{max_iterations}: calling {model_name} "
+            f"with {len(messages)} message(s)"
         )
+        if previous_prompt_tokens is not None:
+            status_message += f"; previous prompt_tokens={previous_prompt_tokens}"
+        _notify_status(status_callback, status_message)
 
         backoff = 1
         response = None
@@ -404,6 +420,8 @@ Be concise but thorough. Ignore minor style issues."""
                     "messages": messages,
                     "temperature": 0.2,
                 }
+                if model_context_window_tokens is not None:
+                    completion_kwargs["max_tokens"] = GLM_5_2_MAX_OUTPUT_TOKENS
                 if glm_5_2_reasoning_effort:
                     thinking_type = (
                         "disabled"
@@ -419,12 +437,7 @@ Be concise but thorough. Ignore minor style issues."""
                             }
                         },
                     )
-                if force_final_response or final_iteration:
-                    completion_kwargs.update(
-                        tools=REVIEWER_TOOLS,
-                        tool_choice="none",
-                    )
-                else:
+                if not (force_final_response or final_synthesis_iteration):
                     completion_kwargs.update(
                         tools=REVIEWER_TOOLS,
                         tool_choice="auto",
@@ -465,11 +478,14 @@ Be concise but thorough. Ignore minor style issues."""
                 trace_enabled,
             )
 
-        message = response.choices[0].message
+        choice = response.choices[0]
+        message = choice.message
+        finish_reason = getattr(choice, "finish_reason", None)
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)
         completion_tokens = getattr(usage, "completion_tokens", None)
         if isinstance(prompt_tokens, int):
+            previous_prompt_tokens = prompt_tokens
             usage_trace = f"Iteration {iteration + 1}: API usage {prompt_tokens} prompt tokens"
             if isinstance(completion_tokens, int):
                 usage_trace += f", {completion_tokens} completion tokens"
@@ -488,8 +504,32 @@ Be concise but thorough. Ignore minor style issues."""
                     trace.append(
                         "Model token budget reached; forcing final response on the next iteration"
                     )
+        content = _message_content_to_text(message.content)
+        if finish_reason == "length":
+            trace.append(
+                f"Iteration {iteration + 1}: completion reached the model output limit"
+            )
+            if final_iteration:
+                error_msg = (
+                    "Error: Model reached its maximum output length before returning "
+                    "a final code review."
+                )
+                logger.error(error_msg)
+                _notify_status(status_callback, error_msg)
+                return _append_review_trace(error_msg, trace, trace_enabled)
+            # A partial structured tool call cannot safely be replayed because
+            # its arguments may be truncated.  Retry from the last complete
+            # conversation state instead.  Plain assistant text can be retained
+            # so preserved thinking continues naturally on the next turn.
+            if not message.tool_calls and content.strip():
+                messages.append(message)
+            _notify_status(
+                status_callback,
+                "Model reached its output limit; continuing the review.",
+            )
+            continue
+
         if not message.tool_calls:
-            content = _message_content_to_text(message.content)
             if content.strip():
                 if _looks_like_unfinished_pseudo_tool_response(content):
                     trace.append(
@@ -631,7 +671,7 @@ Be concise but thorough. Ignore minor style issues."""
                             trace.append(
                                 "Review context budget reached; forcing final response"
                             )
-            trace.append(f"Tool call: {func_name} -> {len(result)} chars")
+            trace.append(f"Tool call: {func_name}")
             messages.append(
                 {
                     "role": "tool",

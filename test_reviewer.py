@@ -25,8 +25,14 @@ def _tool_message(
     )
 
 
-def _model_response(message: SimpleNamespace) -> SimpleNamespace:
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)])
+def _model_response(
+    message: SimpleNamespace,
+    *,
+    finish_reason: str | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
+    )
 
 
 class RunAgenticReviewEnvTests(unittest.TestCase):
@@ -394,12 +400,9 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertIn("API usage", result)
         self.assertIn("Model token budget reached", result)
         execute_tool.assert_not_called()
-        self.assertEqual(
-            fake_client.chat.completions.create.call_args_list[1].kwargs[
-                "tool_choice"
-            ],
-            "none",
-        )
+        final_call = fake_client.chat.completions.create.call_args_list[1].kwargs
+        self.assertNotIn("tools", final_call)
+        self.assertNotIn("tool_choice", final_call)
 
     def test_model_api_timeout_can_be_overridden(self) -> None:
         with mock.patch.dict(
@@ -468,6 +471,51 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         )
         self.assertTrue(any("Review complete" in status for status in statuses))
 
+    def test_status_reports_message_count_and_previous_prompt_tokens(self) -> None:
+        tool_message = _tool_message("list_repository_tree", {})
+        final_message = SimpleNamespace(content="final review", tool_calls=None)
+        first_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=tool_message)],
+            usage=SimpleNamespace(prompt_tokens=123),
+        )
+        second_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=final_message)],
+            usage=SimpleNamespace(prompt_tokens=456),
+        )
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.side_effect = [
+            first_response,
+            second_response,
+        ]
+        statuses: list[str] = []
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"MAX_REVIEW_ITERATIONS": "3"},
+                    clear=False,
+                ),
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+                mock.patch(
+                    "review_mcp.review._execute_tool",
+                    return_value="small result",
+                ),
+            ):
+                result = reviewer.run_agentic_review(
+                    working_dir=tmpdir,
+                    status_callback=statuses.append,
+                )
+
+        self.assertEqual(result, "final review")
+        call_statuses = [status for status in statuses if "calling " in status]
+        self.assertEqual(len(call_statuses), 2)
+        self.assertIn("with 2 message(s)", call_statuses[0])
+        self.assertNotIn("chars", call_statuses[0])
+        self.assertIn("with 4 message(s)", call_statuses[1])
+        self.assertIn("previous prompt_tokens=123", call_statuses[1])
+        self.assertNotIn("chars", call_statuses[1])
+
     def test_default_review_model_is_glm_5_2(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_client = mock.Mock()
@@ -486,6 +534,10 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
 
         self.assertEqual(
             fake_client.chat.completions.create.call_args.kwargs["model"], "glm-5.2"
+        )
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args.kwargs["max_tokens"],
+            reviewer.GLM_5_2_MAX_OUTPUT_TOKENS,
         )
 
     def test_legacy_zhipu_model_env_still_overrides_default(self) -> None:
@@ -700,6 +752,18 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
                 "Next, I'll call the repository tool."
             )
         )
+        self.assertTrue(
+            reviewer._looks_like_unfinished_pseudo_tool_response(
+                "I need to verify two remaining details to finalize my review. "
+                "Let me make focused calls."
+            )
+        )
+        self.assertFalse(
+            reviewer._looks_like_unfinished_pseudo_tool_response(
+                "Let me review each concern in turn. "
+                + "The implementation is sound and the test covers the boundary. " * 12
+            )
+        )
 
     def test_unfinished_pseudo_tool_response_continues_before_final_iteration(
         self,
@@ -727,6 +791,20 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
                 result = reviewer.run_agentic_review(working_dir=tmpdir)
 
         self.assertEqual(result, "final review")
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args_list[0].kwargs["tools"],
+            reviewer.REVIEWER_TOOLS,
+        )
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args_list[0].kwargs["tool_choice"],
+            "auto",
+        )
+        self.assertNotIn(
+            "tools", fake_client.chat.completions.create.call_args_list[1].kwargs
+        )
+        self.assertNotIn(
+            "tool_choice", fake_client.chat.completions.create.call_args_list[1].kwargs
+        )
         second_messages = fake_client.chat.completions.create.call_args_list[1].kwargs[
             "messages"
         ]
@@ -758,6 +836,58 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             result,
         )
         self.assertNotIn("<tool_call>", result)
+
+    def test_output_length_finish_is_not_accepted_as_a_final_review(self) -> None:
+        truncated_message = SimpleNamespace(
+            content="partial review",
+            tool_calls=None,
+        )
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.return_value = _model_response(
+            truncated_message,
+            finish_reason="length",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"MAX_REVIEW_ITERATIONS": "1"},
+                    clear=False,
+                ),
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+            ):
+                result = reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertIn("reached its maximum output length", result)
+        self.assertNotEqual(result, "partial review")
+
+    def test_length_truncated_tool_call_is_not_executed(self) -> None:
+        truncated_tool_message = _tool_message(
+            "read_file",
+            {"path": "partial.py"},
+        )
+        final_message = SimpleNamespace(content="final review", tool_calls=None)
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.side_effect = [
+            _model_response(truncated_tool_message, finish_reason="length"),
+            _model_response(final_message, finish_reason="stop"),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"MAX_REVIEW_ITERATIONS": "2"},
+                    clear=False,
+                ),
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+                mock.patch("review_mcp.review._execute_tool") as execute_tool,
+            ):
+                result = reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertEqual(result, "final review")
+        execute_tool.assert_not_called()
 
     def test_structured_final_response_content_is_supported(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -828,6 +958,7 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
 
         call_kwargs = fake_client.chat.completions.create.call_args.kwargs
         self.assertEqual(call_kwargs["reasoning_effort"], "high")
+        self.assertEqual(call_kwargs["max_tokens"], 131_072)
         self.assertEqual(
             call_kwargs["extra_body"],
             {
@@ -1252,7 +1383,9 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             "auto",
         )
 
-    def test_last_iteration_is_reserved_for_final_response_without_tool_calls(self) -> None:
+    def test_synthesis_reservation_preserves_a_tool_iteration_for_small_limits(
+        self,
+    ) -> None:
         tool_message = _tool_message("list_repository_tree", {})
         final_message = SimpleNamespace(content="final review", tool_calls=None)
         fake_client = mock.Mock()
@@ -1277,13 +1410,12 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
                 result = reviewer.run_agentic_review(working_dir=tmpdir)
 
         self.assertEqual(result, "final review")
-        self.assertEqual(
-            fake_client.chat.completions.create.call_args_list[0].kwargs["tool_choice"],
-            "auto",
-        )
+        first_call = fake_client.chat.completions.create.call_args_list[0].kwargs
+        self.assertEqual(first_call["tools"], reviewer.REVIEWER_TOOLS)
+        self.assertEqual(first_call["tool_choice"], "auto")
         final_call = fake_client.chat.completions.create.call_args_list[1].kwargs
-        self.assertEqual(final_call["tools"], reviewer.REVIEWER_TOOLS)
-        self.assertEqual(final_call["tool_choice"], "none")
+        self.assertNotIn("tools", final_call)
+        self.assertNotIn("tool_choice", final_call)
 
     def test_openspec_change_directory_expands_to_context_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
