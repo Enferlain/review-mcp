@@ -112,8 +112,8 @@ async def _run_review_with_timeout(
         timeout_label = int(timeout_seconds) if timeout_seconds.is_integer() else timeout_seconds
         return (
             f"Error: review timed out after {timeout_label}s before the MCP host limit. "
-            "Try narrowing focus_files, adding targeted context_files, or reducing "
-            "MAX_REVIEW_ITERATIONS / REVIEW_TOOL_TIMEOUT_SECONDS."
+            "Try narrowing focus_files, adding targeted context_files, or adjusting "
+            "REVIEW_TOOL_TIMEOUT_SECONDS."
         )
 
     return result or "No review generated."

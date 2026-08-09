@@ -17,7 +17,6 @@ from review_mcp.config import (
     GLM_5_2_MAX_OUTPUT_TOKENS,
     _env_flag,
     _get_glm_5_2_reasoning_effort,
-    _get_max_iterations,
     _get_optional_positive_int_env,
     _get_positive_int_env,
     logger,
@@ -367,8 +366,6 @@ Be concise but thorough. Ignore minor style issues."""
     )
     if glm_5_2_reasoning_effort:
         trace.append(f"Reasoning effort: {glm_5_2_reasoning_effort}")
-    max_iterations = _get_max_iterations()
-    trace.append(f"Max review iterations: {max_iterations}")
     logger.info("Starting review...")
     logger.info("Found %s changed files", len(changed_files))
     logger.info("Loaded %s context file paths", len(loaded_context_files))
@@ -391,12 +388,16 @@ Be concise but thorough. Ignore minor style issues."""
     tool_schema_chars = len(json.dumps(REVIEWER_TOOLS, ensure_ascii=False))
     force_final_response = False
     previous_prompt_tokens: int | None = None
-    synthesis_iterations = min(2, max(0, max_iterations - 1))
-    final_synthesis_start = max_iterations - synthesis_iterations
-    for iteration in range(max_iterations):
-        final_iteration = iteration + 1 == max_iterations
-        final_synthesis_iteration = iteration >= final_synthesis_start
-        logger.info("Iteration %s: Calling GLM...", iteration + 1)
+    model_call_count = 0
+    truncated_tool_call_retry_sent = False
+    # Tool use is bounded by the model context window, not an arbitrary number
+    # of calls. Once provider-reported usage consumes the available input
+    # budget, make one tool-free call so the model can synthesize its findings.
+    while True:
+        model_call_count += 1
+        final_response_required = force_final_response
+        phase_label = "Final synthesis" if final_response_required else "Model call"
+        logger.info("%s: Calling GLM...", phase_label)
         serialized_payload_chars = _messages_size_chars(messages) + tool_schema_chars
         logger.debug(
             "Payload size: %s chars across %s messages",
@@ -404,8 +405,7 @@ Be concise but thorough. Ignore minor style issues."""
             len(messages),
         )
         status_message = (
-            f"Iteration {iteration + 1}/{max_iterations}: calling {model_name} "
-            f"with {len(messages)} message(s)"
+            f"{phase_label}: calling {model_name} with {len(messages)} message(s)"
         )
         if previous_prompt_tokens is not None:
             status_message += f"; previous prompt_tokens={previous_prompt_tokens}"
@@ -437,7 +437,7 @@ Be concise but thorough. Ignore minor style issues."""
                             }
                         },
                     )
-                if not (force_final_response or final_synthesis_iteration):
+                if not final_response_required:
                     completion_kwargs.update(
                         tools=REVIEWER_TOOLS,
                         tool_choice="auto",
@@ -457,13 +457,13 @@ Be concise but thorough. Ignore minor style issues."""
                     )
                     _notify_status(
                         status_callback,
-                        f"Iteration {iteration + 1}/{max_iterations}: retryable model error; retrying in {backoff}s.",
+                        f"{phase_label}: retryable model error; retrying in {backoff}s.",
                     )
                     time.sleep(backoff)
                     backoff *= 2
                     continue
 
-                error_msg = f"Error calling model '{model_name}' API at iteration {iteration + 1}: {exc}"
+                error_msg = f"Error calling model '{model_name}' API during {phase_label.lower()}: {exc}"
                 logger.error(error_msg)
                 _notify_status(status_callback, error_msg)
                 if "502" in str(exc) or "500" in str(exc):
@@ -486,7 +486,7 @@ Be concise but thorough. Ignore minor style issues."""
         completion_tokens = getattr(usage, "completion_tokens", None)
         if isinstance(prompt_tokens, int):
             previous_prompt_tokens = prompt_tokens
-            usage_trace = f"Iteration {iteration + 1}: API usage {prompt_tokens} prompt tokens"
+            usage_trace = f"{phase_label}: API usage {prompt_tokens} prompt tokens"
             if isinstance(completion_tokens, int):
                 usage_trace += f", {completion_tokens} completion tokens"
             trace.append(usage_trace)
@@ -497,19 +497,21 @@ Be concise but thorough. Ignore minor style issues."""
                     - GLM_5_2_MAX_OUTPUT_TOKENS
                 )
                 trace.append(
-                    f"Iteration {iteration + 1}: {max(0, remaining_input_tokens)} input tokens remain after reserving the model output allowance"
+                    f"{phase_label}: {max(0, remaining_input_tokens)} input tokens remain after reserving the model output allowance"
                 )
-                if remaining_input_tokens <= 0 and not final_iteration:
+                if remaining_input_tokens <= 0 and not final_response_required:
                     force_final_response = True
                     trace.append(
-                        "Model token budget reached; forcing final response on the next iteration"
+                        "Model token budget reached; requesting final synthesis on the next call"
                     )
         content = _message_content_to_text(message.content)
         if finish_reason == "length":
             trace.append(
-                f"Iteration {iteration + 1}: completion reached the model output limit"
+                f"{phase_label}: completion reached the model output limit"
             )
-            if final_iteration:
+            if final_response_required or (
+                message.tool_calls and truncated_tool_call_retry_sent
+            ):
                 error_msg = (
                     "Error: Model reached its maximum output length before returning "
                     "a final code review."
@@ -521,7 +523,10 @@ Be concise but thorough. Ignore minor style issues."""
             # its arguments may be truncated.  Retry from the last complete
             # conversation state instead.  Plain assistant text can be retained
             # so preserved thinking continues naturally on the next turn.
-            if not message.tool_calls and content.strip():
+            if message.tool_calls:
+                truncated_tool_call_retry_sent = True
+            elif content.strip():
+                truncated_tool_call_retry_sent = False
                 messages.append(message)
             _notify_status(
                 status_callback,
@@ -529,13 +534,15 @@ Be concise but thorough. Ignore minor style issues."""
             )
             continue
 
+        truncated_tool_call_retry_sent = False
+
         if not message.tool_calls:
             if content.strip():
                 if _looks_like_unfinished_pseudo_tool_response(content):
                     trace.append(
-                        f"Iteration {iteration + 1}: model returned an unfinished pseudo-tool response"
+                        f"{phase_label}: model returned an unfinished pseudo-tool response"
                     )
-                    if final_iteration:
+                    if final_response_required:
                         error_msg = (
                             "Error: Model returned an unfinished tool request instead of a final code review. "
                             "Retry the review so the model can return a structured tool call or completed review text."
@@ -544,8 +551,8 @@ Be concise but thorough. Ignore minor style issues."""
                         _notify_status(status_callback, error_msg)
                         return _append_review_trace(error_msg, trace, trace_enabled)
 
-                    # Keep the assistant turn in context and let the next
-                    # iteration recover without modifying the review prompt.
+                    # Keep the assistant turn in context and let the next model
+                    # call recover without modifying the review prompt.
                     messages.append(message)
                     _notify_status(
                         status_callback,
@@ -554,20 +561,27 @@ Be concise but thorough. Ignore minor style issues."""
                     continue
 
                 logger.info("Review complete!")
-                trace.append(f"Review complete after {iteration + 1} iteration(s)")
+                if final_response_required:
+                    trace.append(
+                        f"Review complete during final synthesis after {model_call_count} model call(s)"
+                    )
+                else:
+                    trace.append(
+                        f"Review complete after {model_call_count} model call(s)"
+                    )
                 _notify_status(
                     status_callback, "Review complete; returning the final response."
                 )
                 return _append_review_trace(content, trace, trace_enabled)
 
-            if not empty_final_retry_sent and iteration + 1 < max_iterations:
+            if not empty_final_retry_sent and not final_response_required:
                 empty_final_retry_sent = True
                 _notify_status(
                     status_callback,
                     "Model returned an empty final response; asking for the review text.",
                 )
                 trace.append(
-                    f"Iteration {iteration + 1}: model returned an empty final response; requesting review text"
+                    f"{phase_label}: model returned an empty final response; requesting review text"
                 )
                 messages.append(
                     {
@@ -582,18 +596,26 @@ Be concise but thorough. Ignore minor style issues."""
                 continue
 
             trace.append(
-                f"Review completed with empty content after {iteration + 1} iteration(s)"
+                f"Review completed with empty content during {phase_label.lower()}"
             )
             return _append_review_trace("No review generated.", trace, trace_enabled)
 
+        if final_response_required:
+            error_msg = (
+                "Error: Model returned a structured tool request during final synthesis "
+                "instead of a final code review."
+            )
+            logger.error(error_msg)
+            _notify_status(status_callback, error_msg)
+            return _append_review_trace(error_msg, trace, trace_enabled)
         messages.append(message)
         logger.info("GLM requested %s tool(s)", len(message.tool_calls))
         trace.append(
-            f"Iteration {iteration + 1}: model requested {len(message.tool_calls)} tool call(s)"
+            f"{phase_label}: model requested {len(message.tool_calls)} tool call(s)"
         )
         _notify_status(
             status_callback,
-            f"Iteration {iteration + 1}/{max_iterations}: model requested {len(message.tool_calls)} reviewer tool(s).",
+            f"{phase_label}: model requested {len(message.tool_calls)} reviewer tool(s).",
         )
 
         for tool_call in message.tool_calls:
@@ -679,12 +701,3 @@ Be concise but thorough. Ignore minor style issues."""
                     "content": result,
                 }
             )
-
-    _notify_status(
-        status_callback, "Review stopped after reaching the maximum model iterations."
-    )
-    return _append_review_trace(
-        "Error: Maximum iterations reached without completing review.",
-        trace,
-        trace_enabled,
-    )

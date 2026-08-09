@@ -73,7 +73,6 @@ Environment variables (in `.env`):
 - `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.2`)
 - `AI_REASONING_EFFORT` / `ZHIPU_REASONING_EFFORT` (optional): GLM-5.2 reasoning effort (default: `high`; only sent for `glm-5.2`)
 - `AI_API_TIMEOUT_SECONDS` (optional): Timeout for each model API request (default: 900)
-- `MAX_REVIEW_ITERATIONS` (optional): Max tool-calling iterations (default: 20, capped at 50)
 - `MAX_REVIEW_CONTEXT_CHARS` (optional): Explicit character-based safety ceiling for the accumulated request. Unset by default; character counts are not used as a proxy for model tokens. The completion API's `usage.prompt_tokens` is the authoritative context measurement, and GLM-5.2 enforces its own model window.
 - `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 20000)
 - `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
@@ -115,7 +114,7 @@ OpenSpec change folders are included only when the MCP caller passes the folder 
 }
 ```
 
-If MCP calls feel opaque, set `include_trace` to `true` for a single call or set `REVIEW_MCP_INCLUDE_TRACE=true` in the environment. The returned review will include a compact trace with the workspace, diff target, context-file count, payload sizes, model iterations, and tool calls.
+If MCP calls feel opaque, set `include_trace` to `true` for a single call or set `REVIEW_MCP_INCLUDE_TRACE=true` in the environment. The returned review will include a compact trace with the workspace, diff target, context-file count, model calls, provider-reported token usage, and tool calls.
 
 Trace output is meant for debugging review behavior and can be disabled again once the setup is behaving as expected.
 

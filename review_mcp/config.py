@@ -35,7 +35,6 @@ EXCLUDE_PATTERNS = [
     "pnpm-lock.yaml",
 ]
 
-MAX_ALLOWED_ITERATIONS = 50
 DEFAULT_REVIEW_MODEL = "glm-5.2"
 DEFAULT_GLM_5_2_REASONING_EFFORT = "high"
 GLM_5_2_REASONING_EFFORTS = {
@@ -78,28 +77,6 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if raw_value is None:
         return default
     return raw_value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _get_max_iterations() -> int:
-    """Return a safe iteration limit from the environment."""
-    raw_value = os.getenv("MAX_REVIEW_ITERATIONS", "20")
-    try:
-        value = int(raw_value)
-    except ValueError:
-        logger.warning("Invalid MAX_REVIEW_ITERATIONS=%r; defaulting to 20", raw_value)
-        return 20
-
-    if value < 1:
-        logger.warning("MAX_REVIEW_ITERATIONS must be >= 1; defaulting to 20")
-        return 20
-    if value > MAX_ALLOWED_ITERATIONS:
-        logger.warning(
-            "MAX_REVIEW_ITERATIONS=%s is too high; capping at %s",
-            value,
-            MAX_ALLOWED_ITERATIONS,
-        )
-        return MAX_ALLOWED_ITERATIONS
-    return value
 
 
 def _get_glm_5_2_reasoning_effort() -> str:

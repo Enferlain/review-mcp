@@ -29,10 +29,18 @@ def _model_response(
     message: SimpleNamespace,
     *,
     finish_reason: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
 ) -> SimpleNamespace:
-    return SimpleNamespace(
+    response = SimpleNamespace(
         choices=[SimpleNamespace(message=message, finish_reason=finish_reason)]
     )
+    if prompt_tokens is not None:
+        response.usage = SimpleNamespace(
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
+    return response
 
 
 class RunAgenticReviewEnvTests(unittest.TestCase):
@@ -380,11 +388,7 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"MAX_REVIEW_ITERATIONS": "2"},
-                    clear=True,
-                ),
+                mock.patch.dict(os.environ, {}, clear=True),
                 mock.patch("review_mcp.review._make_client", return_value=fake_client),
                 mock.patch(
                     "review_mcp.review._execute_tool",
@@ -415,25 +419,6 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             os.environ, {"AI_API_TIMEOUT_SECONDS": "invalid"}, clear=False
         ):
             self.assertEqual(reviewer._get_model_api_timeout_seconds(), 900.0)
-
-    def test_invalid_max_review_iterations_falls_back_to_default(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            fake_client = mock.Mock()
-            fake_message = mock.Mock()
-            fake_message.tool_calls = None
-            fake_message.content = "synthetic review"
-            fake_response = mock.Mock()
-            fake_response.choices = [mock.Mock(message=fake_message)]
-            fake_client.chat.completions.create.return_value = fake_response
-
-            with mock.patch.dict(
-                os.environ, {"MAX_REVIEW_ITERATIONS": "not-a-number"}, clear=False
-            ):
-                with mock.patch("review_mcp.review._make_client", return_value=fake_client):
-                    result = reviewer.run_agentic_review(working_dir=tmpdir)
-
-        self.assertEqual(result, "synthetic review")
-        fake_client.chat.completions.create.assert_called_once()
 
     def test_run_agentic_review_reports_status_milestones(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -491,11 +476,6 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"MAX_REVIEW_ITERATIONS": "3"},
-                    clear=False,
-                ),
                 mock.patch("review_mcp.review._make_client", return_value=fake_client),
                 mock.patch(
                     "review_mcp.review._execute_tool",
@@ -668,12 +648,6 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertIn("Error reading context file", content)
         self.assertEqual(diff_files, [])
 
-    def test_max_review_iterations_is_capped(self) -> None:
-        with mock.patch.dict(os.environ, {"MAX_REVIEW_ITERATIONS": "500"}, clear=False):
-            self.assertEqual(
-                reviewer._get_max_iterations(), reviewer.MAX_ALLOWED_ITERATIONS
-            )
-
     def test_include_trace_appends_diagnostic_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             fake_client = mock.Mock()
@@ -765,7 +739,7 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             )
         )
 
-    def test_unfinished_pseudo_tool_response_continues_before_final_iteration(
+    def test_unfinished_pseudo_tool_response_continues_within_context_budget(
         self,
     ) -> None:
         pseudo_message = SimpleNamespace(
@@ -781,11 +755,6 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"MAX_REVIEW_ITERATIONS": "2"},
-                    clear=False,
-                ),
                 mock.patch("review_mcp.review._make_client", return_value=fake_client),
             ):
                 result = reviewer.run_agentic_review(working_dir=tmpdir)
@@ -799,34 +768,39 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             fake_client.chat.completions.create.call_args_list[0].kwargs["tool_choice"],
             "auto",
         )
-        self.assertNotIn(
-            "tools", fake_client.chat.completions.create.call_args_list[1].kwargs
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args_list[1].kwargs["tools"],
+            reviewer.REVIEWER_TOOLS,
         )
-        self.assertNotIn(
-            "tool_choice", fake_client.chat.completions.create.call_args_list[1].kwargs
+        self.assertEqual(
+            fake_client.chat.completions.create.call_args_list[1].kwargs["tool_choice"],
+            "auto",
         )
         second_messages = fake_client.chat.completions.create.call_args_list[1].kwargs[
             "messages"
         ]
         self.assertIs(second_messages[-1], pseudo_message)
 
-    def test_unfinished_pseudo_tool_response_errors_on_final_iteration(self) -> None:
+    def test_unfinished_pseudo_tool_response_errors_during_final_synthesis(self) -> None:
         pseudo_message = SimpleNamespace(
             content="<tool_call>{\"name\": \"read_file\"}</tool_call>",
             tool_calls=None,
         )
         fake_client = mock.Mock()
-        fake_client.chat.completions.create.return_value = _model_response(
-            pseudo_message
-        )
+        fake_client.chat.completions.create.side_effect = [
+            _model_response(
+                pseudo_message,
+                prompt_tokens=(
+                    reviewer.GLM_5_2_CONTEXT_WINDOW_TOKENS
+                    - reviewer.GLM_5_2_MAX_OUTPUT_TOKENS
+                    + 1
+                ),
+            ),
+            _model_response(pseudo_message),
+        ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"MAX_REVIEW_ITERATIONS": "1"},
-                    clear=False,
-                ),
                 mock.patch("review_mcp.review._make_client", return_value=fake_client),
             ):
                 result = reviewer.run_agentic_review(working_dir=tmpdir)
@@ -836,6 +810,8 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             result,
         )
         self.assertNotIn("<tool_call>", result)
+        final_call = fake_client.chat.completions.create.call_args_list[1].kwargs
+        self.assertNotIn("tools", final_call)
 
     def test_output_length_finish_is_not_accepted_as_a_final_review(self) -> None:
         truncated_message = SimpleNamespace(
@@ -843,18 +819,21 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             tool_calls=None,
         )
         fake_client = mock.Mock()
-        fake_client.chat.completions.create.return_value = _model_response(
-            truncated_message,
-            finish_reason="length",
-        )
+        fake_client.chat.completions.create.side_effect = [
+            _model_response(
+                truncated_message,
+                finish_reason="length",
+                prompt_tokens=(
+                    reviewer.GLM_5_2_CONTEXT_WINDOW_TOKENS
+                    - reviewer.GLM_5_2_MAX_OUTPUT_TOKENS
+                    + 1
+                ),
+            ),
+            _model_response(truncated_message, finish_reason="length"),
+        ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"MAX_REVIEW_ITERATIONS": "1"},
-                    clear=False,
-                ),
                 mock.patch("review_mcp.review._make_client", return_value=fake_client),
             ):
                 result = reviewer.run_agentic_review(working_dir=tmpdir)
@@ -876,11 +855,6 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"MAX_REVIEW_ITERATIONS": "2"},
-                    clear=False,
-                ),
                 mock.patch("review_mcp.review._make_client", return_value=fake_client),
                 mock.patch("review_mcp.review._execute_tool") as execute_tool,
             ):
@@ -1383,39 +1357,73 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             "auto",
         )
 
-    def test_synthesis_reservation_preserves_a_tool_iteration_for_small_limits(
-        self,
-    ) -> None:
-        tool_message = _tool_message("list_repository_tree", {})
+    def test_tool_calls_continue_beyond_former_iteration_limit(self) -> None:
+        tool_messages = [
+            _tool_message(
+                "list_repository_tree",
+                {"path": f"dir-{call_number}"},
+                f"call-{call_number}",
+            )
+            for call_number in range(21)
+        ]
         final_message = SimpleNamespace(content="final review", tool_calls=None)
         fake_client = mock.Mock()
         fake_client.chat.completions.create.side_effect = [
-            _model_response(tool_message),
+            *(_model_response(message) for message in tool_messages),
             _model_response(final_message),
         ]
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                mock.patch.dict(
-                    os.environ,
-                    {"MAX_REVIEW_ITERATIONS": "2"},
-                    clear=False,
-                ),
                 mock.patch("review_mcp.review._make_client", return_value=fake_client),
                 mock.patch(
                     "review_mcp.review._execute_tool",
-                    return_value="small result",
+                    return_value="tool result",
                 ),
             ):
                 result = reviewer.run_agentic_review(working_dir=tmpdir)
 
         self.assertEqual(result, "final review")
-        first_call = fake_client.chat.completions.create.call_args_list[0].kwargs
-        self.assertEqual(first_call["tools"], reviewer.REVIEWER_TOOLS)
-        self.assertEqual(first_call["tool_choice"], "auto")
-        final_call = fake_client.chat.completions.create.call_args_list[1].kwargs
-        self.assertNotIn("tools", final_call)
-        self.assertNotIn("tool_choice", final_call)
+        self.assertEqual(fake_client.chat.completions.create.call_count, 22)
+        final_call = fake_client.chat.completions.create.call_args_list[21].kwargs
+        self.assertEqual(final_call["tools"], reviewer.REVIEWER_TOOLS)
+        self.assertEqual(final_call["tool_choice"], "auto")
+
+    def test_structured_tool_request_during_final_synthesis_is_not_executed(
+        self,
+    ) -> None:
+        tool_turn = _tool_message("list_repository_tree", {}, "call-1")
+        boundary_tool_request = _tool_message(
+            "read_file", {"path": "boundary.py"}, "call-2"
+        )
+        final_tool_request = _tool_message("read_file", {"path": "late.py"}, "call-3")
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.side_effect = [
+            _model_response(tool_turn, finish_reason="tool_calls"),
+            _model_response(
+                boundary_tool_request,
+                finish_reason="tool_calls",
+                prompt_tokens=(
+                    reviewer.GLM_5_2_CONTEXT_WINDOW_TOKENS
+                    - reviewer.GLM_5_2_MAX_OUTPUT_TOKENS
+                    + 1
+                ),
+            ),
+            _model_response(final_tool_request, finish_reason="tool_calls"),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+                mock.patch(
+                    "review_mcp.review._execute_tool",
+                    return_value="first result",
+                ) as execute_tool,
+            ):
+                result = reviewer.run_agentic_review(working_dir=tmpdir)
+
+        self.assertIn("structured tool request during final synthesis", result)
+        self.assertEqual(execute_tool.call_count, 1)
 
     def test_openspec_change_directory_expands_to_context_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
