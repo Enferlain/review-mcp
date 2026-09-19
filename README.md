@@ -69,6 +69,7 @@ Environment variables (in `.env`):
 
 - `AI_API_KEY` (required): Your API key
 - `ZHIPU_API_KEY` (optional): Backward-compatible fallback key name
+- `GLM_API_KEY` (optional): Alternate fallback key name
 - `ZHIPU_BASE_URL` (optional): Override API endpoint
 - `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.2`)
 - `AI_REASONING_EFFORT` / `ZHIPU_REASONING_EFFORT` (optional): GLM-5.2 reasoning effort (default: `high`; only sent for `glm-5.2`)
@@ -124,7 +125,7 @@ This server now starts cleanly under MCP hosts because it avoids doing heavy wor
 
 1. Prefer passing `working_directory` per tool call so one MCP config can review any repo.
 2. If your MCP client cannot inject the current repo automatically, set `--workspace-dir` in the config as a fixed fallback.
-3. Prefer setting `AI_API_KEY` as a system/user environment variable instead of storing it in MCP config.
+3. Prefer setting `AI_API_KEY` (or the `GLM_API_KEY` alias) as a system/user environment variable instead of storing it in MCP config.
 4. The tool-level `working_directory` argument still overrides the configured workspace when your agent provides it.
 
 Example Windows fallback path:
