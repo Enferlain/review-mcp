@@ -10,11 +10,15 @@ from .config import _get_model_api_timeout_seconds
 def _make_client():
     from openai import OpenAI
 
-    api_key = os.getenv("AI_API_KEY") or os.getenv("ZHIPU_API_KEY")
+    api_key = (
+        os.getenv("AI_API_KEY")
+        or os.getenv("ZHIPU_API_KEY")
+        or os.getenv("GLM_API_KEY")
+    )
     if not api_key:
         raise ValueError(
             "AI_API_KEY environment variable is not set. "
-            "ZHIPU_API_KEY is also accepted for backward compatibility."
+            "ZHIPU_API_KEY and GLM_API_KEY are also accepted fallback key names."
         )
 
     base_url = os.getenv("ZHIPU_BASE_URL", "https://api.z.ai/api/coding/paas/v4")
