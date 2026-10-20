@@ -14,13 +14,32 @@ from review_mcp.config import (
 )
 
 
-def _append_review_trace(review: str, trace: list[str], enabled: bool) -> str:
+class ReviewResult(str):
+    """Review text with an explicit outcome, compatible with string callers."""
+
+    ok: bool
+
+    def __new__(cls, text: str, *, ok: bool):
+        result = super().__new__(cls, text)
+        result.ok = ok
+        return result
+
+    def __getnewargs_ex__(self):
+        return (str(self),), {"ok": self.ok}
+
+
+def _append_review_trace(
+    review: str, trace: list[str], enabled: bool, *, ok: bool = False
+) -> ReviewResult:
+    """Preserve the outcome when adding diagnostics; only final reviews succeed."""
     if not enabled:
-        return review
+        return ReviewResult(review, ok=ok)
     if not trace:
-        return f"{review}\n\n---\n## Review Trace\n- No trace events recorded."
+        return ReviewResult(
+            f"{review}\n\n---\n## Review Trace\n- No trace events recorded.", ok=ok
+        )
     trace_lines = "\n".join(f"- {item}" for item in trace)
-    return f"{review}\n\n---\n## Review Trace\n{trace_lines}"
+    return ReviewResult(f"{review}\n\n---\n## Review Trace\n{trace_lines}", ok=ok)
 
 
 def _message_content_to_text(content: object) -> str:
@@ -127,6 +146,54 @@ def _normalized_tool_call_key(
             "end_line": end_line,
         }
     return f"{name}:{json.dumps(normalized, sort_keys=True, default=str)}"
+
+
+def _describe_tool_action(name: str, arguments: dict) -> str:
+    """Describe observable repository work without dumping arbitrary arguments."""
+    def brief(value: object, limit: int = 120) -> str:
+        value = " ".join(str(value).split())
+        return value if len(value) <= limit else value[:limit - 1] + "…"
+
+    path = brief(arguments.get("path") or ".")
+    if name == "get_uncommitted_changes":
+        return f"Inspect diff: {brief(arguments.get('target', 'all'))}"
+    if name == "list_changed_files":
+        return "List changed files"
+    if name == "list_repository_tree":
+        return f"List repository tree: {path}"
+    if name == "read_file":
+        start = arguments.get("start_line", 1)
+        end = arguments.get("end_line")
+        lines = f"lines {brief(start)}–{brief(end)}" if end is not None else f"from line {brief(start)}"
+        return f"Read {path}, {lines}"
+    if name == "read_files":
+        paths = arguments.get("paths") or []
+        paths = [paths] if isinstance(paths, str) else paths
+        if not isinstance(paths, list):
+            return "Read file excerpts"
+        selected = paths[:10]
+        names = ", ".join(brief(item, 80) for item in selected[:3])
+        more = f" (+{len(selected) - 3} more)" if len(selected) > 3 else ""
+        return f"Read file excerpts: {names}{more}"
+    if name == "search_repository":
+        glob = arguments.get("file_glob")
+        scope = f"{path} ({brief(glob)})" if glob else path
+        return f"Search {scope} for {brief(arguments.get('query', ''))!r}"
+    return f"Run tool: {brief(name)}"
+
+
+def _tool_action_status(action: str, *, finished: bool) -> str:
+    """Distinguish an in-flight tool operation from its completed result."""
+    verb, separator, detail = action.partition(" ")
+    verbs = {
+        "Read": ("Reading", "Read"),
+        "Search": ("Searching", "Searched"),
+        "Inspect": ("Inspecting", "Inspected"),
+        "List": ("Listing", "Listed"),
+        "Run": ("Running", "Ran"),
+    }
+    ongoing, completed = verbs.get(verb, (verb, verb))
+    return (completed if finished else ongoing) + separator + detail
 
 
 def _execute_tool(

@@ -76,6 +76,7 @@ Environment variables (in `.env`):
 - `AI_API_TIMEOUT_SECONDS` (optional): Timeout for each model API request (default: 900)
 - `MAX_REVIEW_CONTEXT_CHARS` (optional): Explicit character-based safety ceiling for the accumulated request. Unset by default; character counts are not used as a proxy for model tokens. The completion API's `usage.prompt_tokens` is the authoritative context measurement, and the provider enforces its own model window.
 - `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 20000)
+- `MAX_REVIEW_MODEL_CALLS` (optional): Review-turn budget (default: 64; invalid values or values below 2 fall back to 64), including one reserved tool-free final synthesis call. Transient failures can cause up to three HTTP attempts per turn. This bounds long tool loops independently of the selected model's context window. Provider context-limit errors still end the review with a failure; this budget does not estimate tokens.
 - `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
 - `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
 
@@ -96,7 +97,9 @@ Parameters:
 - `model`: Model id for this review, e.g. `glm-5.3` (optional; defaults to `AI_MODEL`/`ZHIPU_MODEL`, then `glm-5.3-flash`)
 - `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (optional; defaults to `AI_REASONING_EFFORT`/`ZHIPU_REASONING_EFFORT`, then `high`; only sent for reasoning-capable GLM models, `none` disables thinking; invalid values return an error listing the options)
 
-While a review runs, the MCP tool emits best-effort status/progress updates for major phases such as loading context, preparing scoped diffs, calling the model, retrying transient model errors, running reviewer tools, and waiting during long model calls. MCP clients that display progress or log notifications can show those updates before the final review returns.
+Progress pairs ongoing and finished work: `Reading …` / `Read …`, `Searching …` / `Searched …`, and `Inspecting …` / `Inspected …`. Searches include their result counts. Each review turn reports the messages sent, then the provider-reported input and output token counts when available. These are per-turn counts; the input includes conversation history. Retries, shortened results, and finalization are also reported.
+
+One review is a tool-use conversation. The model requests repository tools; this server executes them and sends their results back so the model can decide what to inspect next or produce its findings. Each exchange is a **review turn**, not a separate review. A single completion request cannot execute local repository tools by itself. Progress reports observable actions, not the model's private reasoning.
 
 When called, it automatically:
 
@@ -119,7 +122,7 @@ OpenSpec change folders are included only when the MCP caller passes the folder 
 }
 ```
 
-If MCP calls feel opaque, set `include_trace` to `true` for a single call or set `REVIEW_MCP_INCLUDE_TRACE=true` in the environment. The returned review will include a compact trace with the workspace, diff target, context-file count, model calls, provider-reported token usage, and tool calls.
+If MCP calls feel opaque, set `include_trace` to `true` for a single call or set `REVIEW_MCP_INCLUDE_TRACE=true` in the environment. The returned review will include a compact trace with the workspace, diff target, context-file count, review turns, provider-reported token usage, and tool calls.
 
 Trace output is meant for debugging review behavior and can be disabled again once the setup is behaving as expected.
 
@@ -135,6 +138,58 @@ glm-5.3  <- current default
 ```
 
 If the configured default model is not offered by the endpoint, a trailing `Configured default: <model> (not offered by this endpoint)` line notes it instead. The listing uses a short request timeout (15s) and returns an `Error: ...` message when no API key is configured or the provider cannot be reached.
+
+## CLI mode (streaming progress)
+
+Some MCP clients (Codex CLI at the time of writing) neither request MCP progress notifications nor render them, so a long `review_with_context` call shows no sign of life until it finishes. The same review can instead run as a subprocess whose output streams live over the host's exec channel:
+
+```bash
+uvx --from git+https://github.com/Enferlain/review-mcp.git@main review-mcp run <workspace> \
+  [--diff-target staged] [--context PATH ...] [--focus PATH ...] [--task TEXT] \
+  [--model ID] [--reasoning-effort high] [--trace] [--timeout 1800] \
+  [--heartbeat 120] [--progress plain|ndjson|none]
+```
+
+- The review text is printed to **stdout** (the invoking agent captures it as command output); exit code 0 on success, 1 on a failed/timed-out review, 130 on Ctrl-C.
+- Progress goes to **stderr** as concise `[  12.3s] action` lines by default. `--progress ndjson` emits JSON records for automation (`schema_version`, `type` = `status` | `heartbeat` | `result`, `ts`, `elapsed`, `message`; result records add `ok` and `chars`). Consumers should ignore unknown keys and types. Heartbeats default to 120 seconds of silence; `--heartbeat 0` disables them. `--progress none` silences stderr.
+  `chars` counts the review text, excluding the newline added when printing it.
+- `review-mcp models` prints the same live model listing as the `list_models` tool.
+
+Every review started through the CLI or MCP tool automatically keeps a private
+`review-mcp-run-*` directory in the system temporary directory. Its path is
+reported in startup progress (or supplied as `artifacts_dir` and `result_file`
+in CLI NDJSON records). The directory contains:
+
+- `review.md`: the completed review or error response, atomically saved before
+  stdout is written, so losing the terminal connection cannot lose a saved result.
+- `progress.ndjson`: progress records written as they happen, even when terminal
+  progress is disabled with `--progress none`.
+- `status.json`: request options, process ID, outcome, and whether a result exists.
+
+Files are retained after exit, Ctrl-C, or timeout. A hard kill can leave the last
+status as `running` or a partial last progress record; an unfinished review has
+no final result or resume support. If an MCP request is canceled while its worker
+continues, a result that finishes later is still saved. Temporary files may be removed by
+the OS. With CLI `--progress none`, no path is printed; locate runs under the system
+temporary directory by their `review-mcp-run-*` prefix and request metadata.
+
+Review and provider diagnostics use the selected progress format too. `--progress none` suppresses them, including on interruption. Timeout values must be finite and positive; heartbeat values must be finite and nonnegative (0 disables heartbeats).
+
+Example progress (one review, with repository tools between analysis turns):
+
+```text
+[    0.0s] Preparing review of HEAD^.
+[    0.1s] Review turn 1: sending 2 messages to glm-5.3 (effort: high).
+[    4.0s] Review turn 1: received response; 1,234 input tokens, 120 output tokens.
+[    4.0s] Reading server.py, lines 120–180
+[    4.1s] Read server.py, lines 120–180
+[    4.1s] Searching review_mcp for 'run_agentic_review'
+[    4.2s] Searched review_mcp for 'run_agentic_review': 3 matching line(s).
+[    4.3s] Review turn 2: sending 5 messages to glm-5.3.
+[   11.0s] review finished
+```
+
+Running the bare `review-mcp` command with no arguments still starts the MCP server, so existing host registrations are unaffected.
 
 ## Codex / VS Code Notes
 

@@ -6,6 +6,7 @@ import argparse
 import os
 import re
 import sys
+import threading
 import time
 from typing import Awaitable, Callable
 
@@ -28,24 +29,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
-def _get_tool_timeout_seconds() -> int:
+def _get_tool_timeout_seconds(warn: Callable[[str], None] | None = None) -> int:
     """Return a safe tool timeout that stays ahead of host-level deadlines."""
     raw_value = os.getenv("REVIEW_TOOL_TIMEOUT_SECONDS", str(DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS))
+    if warn is None:
+        warn = lambda message: print(message, file=sys.stderr)
     try:
         value = int(raw_value)
     except ValueError:
-        print(
+        warn(
             f"[ReviewMCP] Invalid REVIEW_TOOL_TIMEOUT_SECONDS={raw_value!r}; "
             f"defaulting to {DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS}",
-            file=sys.stderr,
         )
         return DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS
 
-    if value < 1:
-        print(
-            "[ReviewMCP] REVIEW_TOOL_TIMEOUT_SECONDS must be >= 1; "
+    if value < 1 or value > threading.TIMEOUT_MAX:
+        warn(
+            f"[ReviewMCP] REVIEW_TOOL_TIMEOUT_SECONDS must be between 1 and {threading.TIMEOUT_MAX:g}; "
             f"defaulting to {DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS}",
-            file=sys.stderr,
         )
         return DEFAULT_REVIEW_TOOL_TIMEOUT_SECONDS
     return value
@@ -68,7 +69,7 @@ async def _run_review_with_timeout(
     review_call: Callable[[], str],
     timeout_seconds: float,
     status_reporter: Callable[[str, float | None, float | None], Awaitable[None]] | None = None,
-    status_interval_seconds: float = 30.0,
+    status_interval_seconds: float = 120.0,
 ) -> str:
     """Run the blocking review call with status heartbeats and a user-facing timeout."""
     timeout_seconds = float(timeout_seconds)
@@ -171,15 +172,65 @@ def create_mcp(workspace_dir: str | None = None) -> MCPServer:
 
         # Import lazily so MCP startup stays fast and reliable in editors.
         import reviewer
+        from review_mcp.artifacts import ReviewArtifacts
+        from review_mcp.review_tools import ReviewResult
+
+        try:
+            artifacts = ReviewArtifacts(
+                {
+                    "entrypoint": "mcp", "workspace": effective_dir,
+                    "diff_target": diff_target, "context_files": context_files,
+                    "focus_files": focus_files, "task_description": task_description,
+                    "model": model, "reasoning_effort": reasoning_effort,
+                }
+            )
+        except OSError as exc:
+            return f"Error: Could not create saved review files: {exc}"
 
         timeout_seconds = float(_get_tool_timeout_seconds())
         started_at = time.monotonic()
+        last_action_at = started_at
+        last_action = "Preparing review"
+        review_done = threading.Event()
+        persistence_errors: list[OSError] = []
+
+        def finish_artifacts(state: str, *, exit_code: int, message: str) -> None:
+            try:
+                artifacts.finish(state, exit_code=exit_code, message=message)
+            except OSError as exc:
+                persistence_errors.append(exc)
+
+        def persistence_failure(result: str) -> ReviewResult:
+            return ReviewResult(
+                f"{result}\n\nError: Could not save all review files: {persistence_errors[0]}",
+                ok=False,
+            )
+
+        def save_progress(message: str, *, kind: str = "status") -> None:
+            try:
+                artifacts.append_progress(
+                    {
+                        "schema_version": 1, "type": kind, "ts": time.time(),
+                        "elapsed": round(time.monotonic() - started_at, 3), "message": message,
+                    }
+                )
+            except OSError as exc:
+                persistence_errors.append(exc)
 
         async def report_status(
             message: str,
             progress: float | None = None,
             total: float | None = None,
+            *,
+            activity: bool = True,
+            save: bool = True,
         ) -> None:
+            nonlocal last_action_at, last_action
+            if save:
+                save_progress(message, kind="status" if activity else "heartbeat")
+            if activity:
+                last_action_at = time.monotonic()
+                last_action = message
             print(f"[ReviewMCP] {message}", file=sys.stderr)
             if ctx is None:
                 return
@@ -193,29 +244,69 @@ def create_mcp(workspace_dir: str | None = None) -> MCPServer:
                 message=message,
             )
 
-        def report_status_from_thread(message: str) -> None:
-            anyio.from_thread.run(report_status, message, None, None)
+        async def report_saved_status(message: str) -> None:
+            await report_status(message, save=False)
 
-        await report_status(
-            f"Starting review in {effective_dir}.",
-            0,
-            timeout_seconds,
-        )
-        return await _run_review_with_timeout(
-            lambda: reviewer.run_agentic_review(
-                working_dir=effective_dir,
-                diff_target=diff_target,
-                context_files=context_files,
-                focus_files=focus_files,
-                task_description=task_description,
-                include_trace=include_trace,
-                status_callback=report_status_from_thread,
-                model=model,
-                reasoning_effort=reasoning_effort,
-            ),
-            timeout_seconds,
-            report_status,
-        )
+        def report_status_from_thread(message: str) -> None:
+            # Persist before crossing back into the client's cancelable scope.
+            save_progress(message)
+            anyio.from_thread.run(report_saved_status, message)
+
+        async def report_idle(
+            message: str, progress: float | None, total: float | None
+        ) -> None:
+            idle = time.monotonic() - last_action_at
+            if idle >= 120:
+                await report_status(
+                    f"Waiting {int(idle)}s: {last_action}",
+                    progress,
+                    total,
+                    activity=False,
+                )
+
+        def review_call() -> str:
+            try:
+                try:
+                    result = reviewer.run_agentic_review(
+                        working_dir=effective_dir,
+                        diff_target=diff_target,
+                        context_files=context_files,
+                        focus_files=focus_files,
+                        task_description=task_description,
+                        include_trace=include_trace,
+                        status_callback=report_status_from_thread,
+                        model=model,
+                        reasoning_effort=reasoning_effort,
+                    )
+                except BaseException as exc:
+                    result = ReviewResult(f"Error: review crashed: {exc!r}", ok=False)
+                if persistence_errors:
+                    result = persistence_failure(result)
+                try:
+                    artifacts.save_result(result, ok=getattr(result, "ok", True))
+                except OSError as exc:
+                    persistence_errors.append(exc)
+                    result = persistence_failure(result)
+                    finish_artifacts("failed", exit_code=1, message=result)
+                return result
+            finally:
+                review_done.set()
+
+        try:
+            await report_status(
+                f"Starting review in {effective_dir}. Saved review files: {artifacts.directory}",
+                0,
+                timeout_seconds,
+            )
+            result = await _run_review_with_timeout(review_call, timeout_seconds, report_idle)
+        except anyio.get_cancelled_exc_class():
+            finish_artifacts("interrupted", exit_code=130, message="MCP request canceled")
+            raise
+        if not review_done.is_set():
+            finish_artifacts("timed_out", exit_code=1, message=result)
+        if persistence_errors and "Error: Could not save all review files:" not in result:
+            result = persistence_failure(result)
+        return result
 
     @mcp.tool()
     async def list_models() -> str:
@@ -268,8 +359,14 @@ def create_mcp(workspace_dir: str | None = None) -> MCPServer:
 
 
 def main() -> None:
-    """Run the MCP server."""
-    args = parse_args(sys.argv[1:])
+    """Run the MCP server, or a one-shot CLI mode when invoked as `run`/`models`."""
+    argv = sys.argv[1:]
+    if argv and argv[0] in {"run", "models"}:
+        from review_mcp.cli import main as cli_main
+
+        raise SystemExit(cli_main(argv))
+
+    args = parse_args(argv)
     workspace_dir = os.path.abspath(args.workspace_dir) if args.workspace_dir else None
     if workspace_dir:
         print(f"[ReviewMCP] Using default workspace: {workspace_dir}", file=sys.stderr)

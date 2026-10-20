@@ -22,13 +22,16 @@ from review_mcp.config import (
 from review_mcp.context import expand_context_entry, read_context_file_with_links
 from review_mcp.review_tools import (
     REVIEWER_TOOLS,
+    ReviewResult,
     _append_review_trace,
     _content_digest,
+    _describe_tool_action,
     _execute_tool,
     _message_content_to_text,
     _messages_size_chars,
     _normalized_tool_call_key,
     _truncate_content,
+    _tool_action_status,
 )
 from review_mcp.transport import _create_streaming_chat_completion, _make_client
 
@@ -80,8 +83,6 @@ def _looks_like_unfinished_pseudo_tool_response(content: str) -> bool:
     intent_matches = list(_PSEUDO_TOOL_INTENT_RE.finditer(normalized))
     if not intent_matches:
         return False
-    if len(intent_matches) >= 3:
-        return True
     if len(normalized) >= 500:
         return False
     return not bool(_PSEUDO_TOOL_RESOLUTION_RE.search(normalized))
@@ -110,9 +111,11 @@ def run_agentic_review(
     status_callback: ReviewStatusCallback | None = None,
     model: str | None = None,
     reasoning_effort: str | None = None,
-) -> str:
+) -> ReviewResult:
     """
     Run an agentic review where GLM decides what information to gather.
+
+    Returns string-compatible review text with an ``ok`` outcome attribute.
     """
     trace_enabled = (
         _env_flag("REVIEW_MCP_INCLUDE_TRACE")
@@ -144,7 +147,8 @@ def run_agentic_review(
     loaded_context_files: list[str] = []
 
     logger.info("Loading context files...")
-    _notify_status(status_callback, "Loading review context files.")
+    if context_files_to_read:
+        _notify_status(status_callback, "Loading review context files.")
     for context_entry in context_files_to_read:
         resolved_context_entry = repository._resolve_user_path(context_entry, repo_dir)
         expanded_context_files = expand_context_entry(context_entry, repo_dir)
@@ -162,6 +166,7 @@ def run_agentic_review(
         for resolved_context_file in expanded_context_files:
             try:
                 logger.info("  ✓ Loaded %s", resolved_context_file)
+                _notify_status(status_callback, f"Load context: {resolved_context_file}")
                 loaded_context_files.append(str(resolved_context_file))
 
                 processed_content, diff_files = read_context_file_with_links(
@@ -196,7 +201,7 @@ def run_agentic_review(
         logger.info("No specific files - reviewer will decide")
         _notify_status(
             status_callback,
-            "No scoped diff found; the model will inspect changed files with reviewer tools.",
+            f"Preparing review of {diff_target}.",
         )
 
     if files_to_diff:
@@ -352,8 +357,9 @@ Be concise but thorough. Ignore minor style issues."""
 
     model_name = _get_review_model(model)
     try:
+        effective_effort = _get_reasoning_effort(reasoning_effort)
         glm_reasoning_effort = (
-            _get_reasoning_effort(reasoning_effort)
+            effective_effort
             if _supports_reasoning(model_name)
             else None
         )
@@ -364,10 +370,6 @@ Be concise but thorough. Ignore minor style issues."""
     logger.info("Starting review...")
     logger.info("Found %s changed files", len(changed_files))
     logger.info("Loaded %s context file paths", len(loaded_context_files))
-    _notify_status(
-        status_callback,
-        f"Starting model review with {len(changed_files)} changed file(s) and {len(loaded_context_files)} context file(s).",
-    )
 
     empty_final_retry_sent = False
     seen_tool_calls: set[str] = set()
@@ -382,17 +384,25 @@ Be concise but thorough. Ignore minor style issues."""
     }
     tool_schema_chars = len(json.dumps(REVIEWER_TOOLS, ensure_ascii=False))
     force_final_response = False
-    previous_prompt_tokens: int | None = None
-    model_call_count = 0
+    review_turn_count = 0
+    max_review_turns = _get_positive_int_env("MAX_REVIEW_MODEL_CALLS", 64, minimum=2)
+    trace.append(f"Max review turns: {max_review_turns} (including final synthesis)")
     truncated_tool_call_retry_sent = False
-    # Tool use is bounded by the optional character safety ceiling and per-tool
-    # result limits, not an arbitrary number of calls; the provider enforces
-    # its own model context window. When the local budget is exhausted, make
-    # one tool-free call so the model can synthesize its findings.
+    # Reserve the last model call for synthesis. The optional character ceiling
+    # and per-tool limits additionally bound payloads; they are not token counts.
     while True:
-        model_call_count += 1
+        review_turn_count += 1
+        if review_turn_count >= max_review_turns and not force_final_response:
+            force_final_response = True
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "The review-turn budget is exhausted. Provide the final review from the information gathered and state any coverage limitations.",
+                }
+            )
+            trace.append("Review-turn budget reached; requesting final synthesis")
         final_response_required = force_final_response
-        phase_label = "Final synthesis" if final_response_required else "Model call"
+        phase_label = "Final synthesis" if final_response_required else "Analysis"
         logger.info("%s: Calling GLM...", phase_label)
         serialized_payload_chars = _messages_size_chars(messages) + tool_schema_chars
         logger.debug(
@@ -400,11 +410,14 @@ Be concise but thorough. Ignore minor style issues."""
             serialized_payload_chars,
             len(messages),
         )
+        turn_label = f"Review turn {review_turn_count}"
+        effort_label = f" (effort: {glm_reasoning_effort})" if glm_reasoning_effort and review_turn_count == 1 else ""
+        synthesis_label = " for final synthesis" if final_response_required else ""
         status_message = (
-            f"{phase_label}: calling {model_name} with {len(messages)} message(s)"
+            f"{turn_label}: sending {len(messages)} messages to {model_name}"
+            f"{effort_label}{synthesis_label}."
         )
-        if previous_prompt_tokens is not None:
-            status_message += f"; previous prompt_tokens={previous_prompt_tokens}"
+        trace.append(status_message)
         _notify_status(status_callback, status_message)
 
         backoff = 1
@@ -465,9 +478,9 @@ Be concise but thorough. Ignore minor style issues."""
                 return _append_review_trace(error_msg, trace, trace_enabled)
 
         if response is None:
-            _notify_status(status_callback, "Model call did not return a response.")
+            _notify_status(status_callback, "Review request returned no response.")
             return _append_review_trace(
-                "Error: Model call did not return a response.",
+                "Error: Review request returned no response.",
                 trace,
                 trace_enabled,
             )
@@ -478,12 +491,17 @@ Be concise but thorough. Ignore minor style issues."""
         usage = getattr(response, "usage", None)
         prompt_tokens = getattr(usage, "prompt_tokens", None)
         completion_tokens = getattr(usage, "completion_tokens", None)
+        token_metrics = []
         if isinstance(prompt_tokens, int):
-            previous_prompt_tokens = prompt_tokens
+            token_metrics.append(f"{prompt_tokens:,} input tokens")
             usage_trace = f"{phase_label}: API usage {prompt_tokens} prompt tokens"
             if isinstance(completion_tokens, int):
                 usage_trace += f", {completion_tokens} completion tokens"
             trace.append(usage_trace)
+        if isinstance(completion_tokens, int):
+            token_metrics.append(f"{completion_tokens:,} output tokens")
+        if token_metrics:
+            _notify_status(status_callback, f"{turn_label}: received response; {', '.join(token_metrics)}.")
         content = _message_content_to_text(message.content)
         if finish_reason == "length":
             trace.append(
@@ -543,16 +561,13 @@ Be concise but thorough. Ignore minor style issues."""
                 logger.info("Review complete!")
                 if final_response_required:
                     trace.append(
-                        f"Review complete during final synthesis after {model_call_count} model call(s)"
+                        f"Review complete during final synthesis after {review_turn_count} review turn(s)"
                     )
                 else:
                     trace.append(
-                        f"Review complete after {model_call_count} model call(s)"
+                        f"Review complete after {review_turn_count} review turn(s)"
                     )
-                _notify_status(
-                    status_callback, "Review complete; returning the final response."
-                )
-                return _append_review_trace(content, trace, trace_enabled)
+                return _append_review_trace(content, trace, trace_enabled, ok=True)
 
             if not empty_final_retry_sent and not final_response_required:
                 empty_final_retry_sent = True
@@ -593,10 +608,6 @@ Be concise but thorough. Ignore minor style issues."""
         trace.append(
             f"{phase_label}: model requested {len(message.tool_calls)} tool call(s)"
         )
-        _notify_status(
-            status_callback,
-            f"{phase_label}: model requested {len(message.tool_calls)} reviewer tool(s).",
-        )
 
         for tool_call in message.tool_calls:
             func_name = tool_call.function.name
@@ -618,15 +629,17 @@ Be concise but thorough. Ignore minor style issues."""
                 func_args = {}
 
             logger.info("  → %s(%s)", func_name, func_args)
-            _notify_status(status_callback, f"Running reviewer tool: {func_name}.")
+            action = _describe_tool_action(func_name, func_args)
             tool_key = _normalized_tool_call_key(func_name, func_args, repo_dir)
             if tool_key in seen_tool_calls:
                 result = "This exact tool request was already completed. Use the previous result or request a narrower, different range."
                 trace.append(f"Tool call deduplicated: {func_name}")
+                _notify_status(status_callback, f"Skip duplicate request: {action}")
             elif force_final_response:
                 result = "The review context budget has been reached. Produce the final review from the information already gathered."
             else:
                 seen_tool_calls.add(tool_key)
+                _notify_status(status_callback, _tool_action_status(action, finished=False))
                 try:
                     raw_result = _execute_tool(
                         func_name,
@@ -637,10 +650,31 @@ Be concise but thorough. Ignore minor style issues."""
                     logger.error("Reviewer tool %s failed: %s", func_name, exc)
                     raw_result = f"Error running reviewer tool '{func_name}': {exc}"
                     trace.append(f"Tool error contained: {func_name}")
+                if raw_result.startswith((
+                    "Error:", "Error reading repository file ",
+                    "Error running git diff:", "Error searching repository:",
+                    "Error running reviewer tool '",
+                )):
+                    _notify_status(status_callback, f"Tool failed: {action}: {raw_result.splitlines()[0][:200]}")
+                else:
+                    completed_action = _tool_action_status(action, finished=True)
+                    if func_name == "search_repository" and raw_result == "No matches found.":
+                        completed_action += ": no matches."
+                    elif func_name == "search_repository":
+                        lines = raw_result.splitlines()
+                        truncated = bool(lines and re.fullmatch(
+                            r"\.\.\. \[TRUNCATED after \d+ matches; narrow the query or path\]",
+                            lines[-1],
+                        ))
+                        matches = [line for line in (lines[:-1] if truncated else lines) if line]
+                        qualifier = " (result limit reached)" if truncated else ""
+                        completed_action += f": {len(matches)} matching line(s){qualifier}."
+                    _notify_status(status_callback, completed_action)
                 result_digest = _content_digest(raw_result)
                 if raw_result.strip() and result_digest in seen_result_digests:
                     result = "This content was already included in the initial prompt or a previous tool result. Use the existing copy."
                     trace.append(f"Tool result deduplicated: {func_name}")
+                    _notify_status(status_callback, f"Result already supplied: {action}")
                 else:
                     seen_result_digests.add(result_digest)
                     if max_context_chars is None:
@@ -658,6 +692,7 @@ Be concise but thorough. Ignore minor style issues."""
                         trace.append(
                             "Explicit character safety override exhausted; forcing final response"
                         )
+                        _notify_status(status_callback, "Context limit reached; finalize the review.")
                     else:
                         result, result_truncated = _truncate_content(
                             raw_result,
@@ -665,6 +700,7 @@ Be concise but thorough. Ignore minor style issues."""
                             f"{func_name} RESULT",
                         )
                         if result_truncated:
+                            _notify_status(status_callback, f"Large result shortened (head and tail kept): {action}")
                             trace.append(
                                 f"Tool result truncated: {func_name} from {len(raw_result)} to {len(result)} chars"
                             )

@@ -398,26 +398,26 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             reviewer.DEFAULT_REVIEW_MODEL,
         )
         self.assertTrue(
-            any("Loading review context files" in status for status in statuses)
+            any("Preparing review of staged" in status for status in statuses)
         )
         self.assertTrue(
             any(
-                f"calling {reviewer.DEFAULT_REVIEW_MODEL}" in status
+                f"sending 2 messages to {reviewer.DEFAULT_REVIEW_MODEL}" in status
                 for status in statuses
             )
         )
-        self.assertTrue(any("Review complete" in status for status in statuses))
+        self.assertTrue(result.ok)
 
-    def test_status_reports_message_count_and_previous_prompt_tokens(self) -> None:
+    def test_status_shows_tool_lifecycle_and_per_turn_request_metrics(self) -> None:
         tool_message = _tool_message("list_repository_tree", {})
         final_message = SimpleNamespace(content="final review", tool_calls=None)
         first_response = SimpleNamespace(
             choices=[SimpleNamespace(message=tool_message)],
-            usage=SimpleNamespace(prompt_tokens=123),
+            usage=SimpleNamespace(prompt_tokens=123, completion_tokens=17),
         )
         second_response = SimpleNamespace(
             choices=[SimpleNamespace(message=final_message)],
-            usage=SimpleNamespace(prompt_tokens=456),
+            usage=SimpleNamespace(prompt_tokens=456, completion_tokens=21),
         )
         fake_client = mock.Mock()
         fake_client.chat.completions.create.side_effect = [
@@ -437,16 +437,111 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
                 result = reviewer.run_agentic_review(
                     working_dir=tmpdir,
                     status_callback=statuses.append,
+                    include_trace=True,
                 )
 
-        self.assertEqual(result, "final review")
-        call_statuses = [status for status in statuses if "calling " in status]
-        self.assertEqual(len(call_statuses), 2)
-        self.assertIn("with 2 message(s)", call_statuses[0])
-        self.assertNotIn("chars", call_statuses[0])
-        self.assertIn("with 4 message(s)", call_statuses[1])
-        self.assertIn("previous prompt_tokens=123", call_statuses[1])
-        self.assertNotIn("chars", call_statuses[1])
+        self.assertTrue(result.startswith("final review"))
+        self.assertIn("123 prompt tokens", result)
+        self.assertIn("456 prompt tokens", result)
+        self.assertIn("Listing repository tree: .", statuses)
+        self.assertIn("Listed repository tree: .", statuses)
+        self.assertTrue(any("Review turn 1: sending 2 messages" in status for status in statuses))
+        self.assertTrue(any("Review turn 2: sending 4 messages" in status for status in statuses))
+        self.assertIn("Review turn 1: received response; 123 input tokens, 17 output tokens.", statuses)
+        self.assertIn("Review turn 2: received response; 456 input tokens, 21 output tokens.", statuses)
+        self.assertFalse(any("Analyze tool results" in status for status in statuses))
+        self.assertTrue(any("Large result shortened" in s for s in statuses))
+        self.assertFalse(any("message(s)" in s or "prompt_tokens" in s or "Model call" in s for s in statuses))
+
+    def test_progress_pairs_ongoing_and_finished_tools(self) -> None:
+        tool_messages = [
+            _tool_message("read_file", {"path": "server.py", "start_line": 120, "end_line": 180}, "read"),
+            _tool_message("search_repository", {"query": "run_agentic_review", "path": "review_mcp", "file_glob": "*.py"}, "search"),
+            _tool_message("read_file", {"path": "server.py", "start_line": 120, "end_line": 180}, "duplicate"),
+        ]
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.side_effect = [
+            *(_model_response(turn) for turn in tool_messages),
+            _model_response(SimpleNamespace(content="review", tool_calls=None)),
+        ]
+        statuses = []
+
+        def execute_tool(name, args, **kwargs):
+            if name == "read_file":
+                self.assertEqual(statuses[-1], "Reading server.py, lines 120–180")
+                self.assertNotIn("Read server.py, lines 120–180", statuses)
+                return "file content"
+            self.assertEqual(statuses[-1], "Searching review_mcp (*.py) for 'run_agentic_review'")
+            self.assertFalse(any(status.startswith("Searched ") for status in statuses))
+            return "review_mcp/review.py:104:def run_agentic_review("
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+                mock.patch("review_mcp.review._execute_tool", side_effect=execute_tool) as execute,
+            ):
+                result = reviewer.run_agentic_review(working_dir=tmpdir, status_callback=statuses.append)
+        self.assertTrue(result.ok)
+        self.assertEqual(execute.call_count, 2)
+        self.assertIn("Read server.py, lines 120–180", statuses)
+        self.assertIn("Reading server.py, lines 120–180", statuses)
+        self.assertLess(statuses.index("Reading server.py, lines 120–180"), statuses.index("Read server.py, lines 120–180"))
+        self.assertEqual(statuses.count("Reading server.py, lines 120–180"), 1)
+        self.assertIn("Searching review_mcp (*.py) for 'run_agentic_review'", statuses)
+        self.assertIn("Searched review_mcp (*.py) for 'run_agentic_review': 1 matching line(s).", statuses)
+        self.assertIn("Skip duplicate request: Read server.py, lines 120–180", statuses)
+        self.assertFalse(any("message(s)" in status or "prompt_tokens=" in status or "Model call" in status for status in statuses))
+
+    def test_missing_usage_is_not_estimated_in_progress(self) -> None:
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.return_value = _model_response(
+            SimpleNamespace(content="review", tool_calls=None)
+        )
+        statuses = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("review_mcp.review._make_client", return_value=fake_client):
+                result = reviewer.run_agentic_review(working_dir=tmpdir, status_callback=statuses.append)
+        self.assertTrue(result.ok)
+        self.assertTrue(any("sending 2 messages" in status for status in statuses))
+        self.assertFalse(any("tokens" in status for status in statuses))
+
+    def test_progress_distinguishes_search_markers_from_matching_source_text(self) -> None:
+        examples = [
+            ("search_repository", "src/file.py:10:marker = '[TRUNCATED after 20 matches]'", "Searched . for 'TRUNCATED': 1 matching line(s)."),
+            ("search_repository", "src/file.py:10:first\nsrc/file.py:20:second\n... [TRUNCATED after 2 matches; narrow the query or path]", "Searched . for 'TRUNCATED': 2 matching line(s) (result limit reached)."),
+            ("list_changed_files", "ErrorHandlers.py", None),
+            ("read_file", "Error: Repository path does not exist: missing.py", "Tool failed:"),
+        ]
+        for name, text, expected in examples:
+            with self.subTest(name=name, text=text):
+                fake_client = mock.Mock()
+                fake_client.chat.completions.create.side_effect = [
+                    _model_response(_tool_message(name, {"query": "TRUNCATED"})),
+                    _model_response(SimpleNamespace(content="review", tool_calls=None)),
+                ]
+                statuses = []
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    with (
+                        mock.patch("review_mcp.review._make_client", return_value=fake_client),
+                        mock.patch("review_mcp.review._execute_tool", return_value=text),
+                    ):
+                        result = reviewer.run_agentic_review(working_dir=tmpdir, status_callback=statuses.append)
+                self.assertTrue(result.ok)
+                if expected:
+                    self.assertTrue(any(status.startswith(expected) for status in statuses), statuses)
+                if "src/file.py:10:marker" in text:
+                    self.assertFalse(any("result limit reached" in status for status in statuses))
+                if name == "list_changed_files":
+                    self.assertFalse(any("Tool failed" in status for status in statuses))
+                if name == "read_file":
+                    self.assertFalse(any(status.startswith("Read ") for status in statuses))
+
+    def test_tool_action_descriptions_are_bounded_and_single_line(self) -> None:
+        from review_mcp.review_tools import _describe_tool_action
+        action = _describe_tool_action("search_repository", {"query": "a\n" * 1000, "path": "src\nfolder"})
+        self.assertNotIn("\n", action)
+        self.assertLess(len(action), 180)
+        self.assertEqual(_describe_tool_action("read_files", {"paths": ["a.py", "b.py", "c.py", "d.py"]}), "Read file excerpts: a.py, b.py, c.py (+1 more)")
 
     def test_default_review_model_is_glm_5_3_flash(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -642,6 +737,20 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertEqual(fake_client.chat.completions.create.call_count, 2)
 
     def test_unfinished_pseudo_tool_response_detector_is_conservative(self) -> None:
+        self.assertFalse(
+            reviewer._looks_like_unfinished_pseudo_tool_response(
+                "Review complete. The comments say 'I will read the file', "
+                "'I will inspect the diff', and 'I will check the tests'. "
+                "These are documentation examples. The implementation is correct."
+            )
+        )
+        self.assertFalse(
+            reviewer._looks_like_unfinished_pseudo_tool_response(
+                "## Review\n" + "The test covers the boundary. " * 30
+                + " Follow-ups: I'll read the documentation, I'll inspect the examples, "
+                "and I'll check the tutorial in a separate task."
+            )
+        )
         self.assertTrue(
             reviewer._looks_like_unfinished_pseudo_tool_response(
                 "<tool_call>{\"name\": \"read_file\"}</tool_call>"
@@ -1552,6 +1661,52 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         final_call = fake_client.chat.completions.create.call_args_list[21].kwargs
         self.assertEqual(final_call["tools"], reviewer.REVIEWER_TOOLS)
         self.assertEqual(final_call["tool_choice"], "auto")
+
+    def test_model_call_budget_reserves_final_synthesis_without_character_limit(self) -> None:
+        tool_turn = _tool_message("list_repository_tree", {})
+        final_turn = SimpleNamespace(content="final review", tool_calls=None)
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.side_effect = [
+            _model_response(tool_turn), _model_response(final_turn)
+        ]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.dict(os.environ, {"MAX_REVIEW_MODEL_CALLS": "2"}, clear=True),
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+                mock.patch("review_mcp.review._execute_tool", return_value="tool result") as execute,
+            ):
+                result = reviewer.run_agentic_review(working_dir=tmpdir, include_trace=True)
+        self.assertTrue(result.ok)
+        self.assertIn("Review-turn budget reached", result)
+        self.assertEqual(fake_client.chat.completions.create.call_count, 2)
+        execute.assert_called_once()
+        final_kwargs = fake_client.chat.completions.create.call_args.kwargs
+        self.assertNotIn("tools", final_kwargs)
+        self.assertNotIn("tool_choice", final_kwargs)
+
+    def test_model_call_budget_terminates_repeated_truncated_text(self) -> None:
+        truncated = SimpleNamespace(content="partial review", tool_calls=None)
+        fake_client = mock.Mock()
+        fake_client.chat.completions.create.return_value = _model_response(truncated, finish_reason="length")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.dict(os.environ, {"MAX_REVIEW_MODEL_CALLS": "3"}, clear=True),
+                mock.patch("review_mcp.review._make_client", return_value=fake_client),
+            ):
+                result = reviewer.run_agentic_review(working_dir=tmpdir, include_trace=True)
+        self.assertFalse(result.ok)
+        self.assertIn("maximum output length", result)
+        self.assertEqual(fake_client.chat.completions.create.call_count, 3)
+        self.assertNotIn("tools", fake_client.chat.completions.create.call_args.kwargs)
+
+    def test_invalid_effort_for_non_glm_model_returns_error(self) -> None:
+        fake_client = mock.Mock()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with mock.patch("review_mcp.review._make_client", return_value=fake_client):
+                result = reviewer.run_agentic_review(working_dir=tmpdir, model="custom-model", reasoning_effort="bogus")
+        self.assertFalse(result.ok)
+        self.assertIn("Invalid reasoning_effort", result)
+        fake_client.chat.completions.create.assert_not_called()
 
     def test_structured_tool_request_during_final_synthesis_is_not_executed(
         self,
