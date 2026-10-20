@@ -4,6 +4,7 @@ MCP server entrypoint for agentic code review.
 
 import argparse
 import os
+import re
 import sys
 import time
 from typing import Awaitable, Callable
@@ -132,6 +133,8 @@ def create_mcp(workspace_dir: str | None = None) -> MCPServer:
         task_description: str = "",
         working_directory: str | None = None,
         include_trace: bool | None = None,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
         ctx: Context = None,
     ) -> str:
         """
@@ -144,6 +147,13 @@ def create_mcp(workspace_dir: str | None = None) -> MCPServer:
             task_description: Optional task description for reviewer intent
             working_directory: Git repository root to review. Required unless the server was started with --workspace-dir
             include_trace: Include a compact diagnostic trace in the returned review
+            model: Optional model id for this review (e.g. 'glm-5.3'); defaults to
+                AI_MODEL/ZHIPU_MODEL (glm-5.3-flash). Use list_models to discover
+                available ids.
+            reasoning_effort: Optional reasoning effort for reasoning-capable GLM models
+                ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'); defaults to
+                AI_REASONING_EFFORT/ZHIPU_REASONING_EFFORT ('high'). 'none' disables
+                thinking. Invalid values return an error listing the options.
 
         Returns:
             The generated code review.
@@ -200,10 +210,59 @@ def create_mcp(workspace_dir: str | None = None) -> MCPServer:
                 task_description=task_description,
                 include_trace=include_trace,
                 status_callback=report_status_from_thread,
+                model=model,
+                reasoning_effort=reasoning_effort,
             ),
             timeout_seconds,
             report_status,
         )
+
+    @mcp.tool()
+    async def list_models() -> str:
+        """
+        List the model ids currently available from the configured GLM provider.
+
+        Queries the provider's models endpoint live using the configured API key
+        and base URL, so the list reflects what the endpoint actually offers right
+        now instead of a hardcoded snapshot. The review server's currently
+        configured default model is marked in the output.
+
+        Returns:
+            One model id per line with the configured default model marked, or an
+            'Error: ...' message when no API key is configured or the provider
+            cannot be reached.
+        """
+        import reviewer  # Imported lazily so MCP startup stays fast.
+
+        try:
+            model_ids = await anyio.to_thread.run_sync(reviewer._list_available_models)
+        except ValueError as exc:
+            return f"Error: {exc}"
+        except Exception as exc:
+            return f"Error: Could not list models from the provider: {exc}"
+
+        if not model_ids:
+            return "Error: The provider returned no models."
+
+        default_model = reviewer._get_review_model()
+
+        def _base_model_id(model_id: str) -> str:
+            # Variant suffixes like '[1m]' select a context size on some
+            # endpoints but are not part of the listed id; compare the base id.
+            return re.sub(r"\[[^\]]*\]$", "", model_id.strip().lower())
+
+        default_base = _base_model_id(default_model)
+        lines = [
+            f"{model_id}  <- current default"
+            if _base_model_id(model_id) == default_base
+            else model_id
+            for model_id in model_ids
+        ]
+        if not any("<-" in line for line in lines):
+            lines.append(
+                f"Configured default: {default_model} (not offered by this endpoint)"
+            )
+        return "\n".join(lines)
 
     return mcp
 

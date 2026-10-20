@@ -12,6 +12,8 @@ from review_mcp.config import (
     DEFAULT_SEARCH_RESULTS,
     DEFAULT_TREE_ENTRIES,
 )
+
+
 def _append_review_trace(review: str, trace: list[str], enabled: bool) -> str:
     if not enabled:
         return review
@@ -72,12 +74,25 @@ def _content_digest(content: str) -> str:
 
 
 def _truncate_content(content: str, limit: int, label: str) -> tuple[str, bool]:
-    """Truncate text to a hard character limit while preserving a clear marker."""
+    """Truncate text to a hard character limit, keeping head and tail.
+
+    The marker at the seam reports the original size so the model knows how
+    much it is missing and can request a narrower range instead of assuming
+    it saw everything.
+    """
     if len(content) <= limit:
         return content, False
-    marker = f"\n... [{label} TRUNCATED at {limit} chars]"
+    original_chars = len(content)
+    original_lines = content.count("\n") + 1
+    marker = (
+        f"\n... [{label} TRUNCATED: kept the first and last portions; "
+        f"original was {original_chars} chars / {original_lines} lines, "
+        f"limit {limit} chars]"
+    )
     keep = max(0, limit - len(marker))
-    return content[:keep] + marker, True
+    head = keep // 2
+    tail = keep - head
+    return content[:head] + marker + (content[-tail:] if tail else ""), True
 
 
 def _normalized_tool_call_key(

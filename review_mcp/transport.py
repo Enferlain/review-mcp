@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 
-from .config import _get_model_api_timeout_seconds
+from .config import LIST_MODELS_TIMEOUT_SECONDS, _get_model_api_timeout_seconds
 
 
 def _make_client():
@@ -27,6 +27,17 @@ def _make_client():
         base_url=base_url,
         timeout=_get_model_api_timeout_seconds(),
     )
+
+
+def _list_available_models() -> list[str]:
+    """Return the sorted model ids offered by the configured provider endpoint.
+
+    Uses a short request timeout: the models endpoint is fast metadata,
+    unlike long-running completion calls.
+    """
+    client = _make_client().with_options(timeout=LIST_MODELS_TIMEOUT_SECONDS)
+    response = client.models.list()
+    return sorted({model.id for model in response.data})
 
 
 def _create_streaming_chat_completion(client, **kwargs):

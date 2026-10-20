@@ -71,17 +71,19 @@ Environment variables (in `.env`):
 - `ZHIPU_API_KEY` (optional): Backward-compatible fallback key name
 - `GLM_API_KEY` (optional): Alternate fallback key name
 - `ZHIPU_BASE_URL` (optional): Override API endpoint
-- `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.2`)
-- `AI_REASONING_EFFORT` / `ZHIPU_REASONING_EFFORT` (optional): GLM-5.2 reasoning effort (default: `high`; only sent for `glm-5.2`)
+- `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.3-flash`); can also be set per call via the `model` parameter — use the `list_models` tool to see what the endpoint offers
+- `AI_REASONING_EFFORT` / `ZHIPU_REASONING_EFFORT` (optional): Reasoning effort (default: `high`), sent for GLM models with reasoning controls (the `glm-4.5`+ family); also settable per call via the `reasoning_effort` parameter, where `none` disables thinking. Note: these request parameters are now sent for the whole `glm-4.5`+ family, not just `glm-5.2`.
 - `AI_API_TIMEOUT_SECONDS` (optional): Timeout for each model API request (default: 900)
-- `MAX_REVIEW_CONTEXT_CHARS` (optional): Explicit character-based safety ceiling for the accumulated request. Unset by default; character counts are not used as a proxy for model tokens. The completion API's `usage.prompt_tokens` is the authoritative context measurement, and GLM-5.2 enforces its own model window.
+- `MAX_REVIEW_CONTEXT_CHARS` (optional): Explicit character-based safety ceiling for the accumulated request. Unset by default; character counts are not used as a proxy for model tokens. The completion API's `usage.prompt_tokens` is the authoritative context measurement, and the provider enforces its own model window.
 - `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 20000)
 - `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
 - `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
 
 ## Usage
 
-The MCP exposes **1 tool**: `review_with_context`
+The MCP exposes **2 tools**: `review_with_context` and `list_models`
+
+### `review_with_context`
 
 Parameters:
 
@@ -91,6 +93,8 @@ Parameters:
 - `task_description`: Description of what you're trying to accomplish
 - `working_directory`: Git repository root to review (required unless the server was started with `--workspace-dir`)
 - `include_trace`: Include a compact diagnostic trace in the returned review (optional, defaults to `REVIEW_MCP_INCLUDE_TRACE`)
+- `model`: Model id for this review, e.g. `glm-5.3` (optional; defaults to `AI_MODEL`/`ZHIPU_MODEL`, then `glm-5.3-flash`)
+- `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (optional; defaults to `AI_REASONING_EFFORT`/`ZHIPU_REASONING_EFFORT`, then `high`; only sent for reasoning-capable GLM models, `none` disables thinking; invalid values return an error listing the options)
 
 While a review runs, the MCP tool emits best-effort status/progress updates for major phases such as loading context, preparing scoped diffs, calling the model, retrying transient model errors, running reviewer tools, and waiting during long model calls. MCP clients that display progress or log notifications can show those updates before the final review returns.
 
@@ -118,6 +122,19 @@ OpenSpec change folders are included only when the MCP caller passes the folder 
 If MCP calls feel opaque, set `include_trace` to `true` for a single call or set `REVIEW_MCP_INCLUDE_TRACE=true` in the environment. The returned review will include a compact trace with the workspace, diff target, context-file count, model calls, provider-reported token usage, and tool calls.
 
 Trace output is meant for debugging review behavior and can be disabled again once the setup is behaving as expected.
+
+### `list_models`
+
+Lists the model ids currently available from the configured provider, queried live from the endpoint's models listing (using the configured API key and `ZHIPU_BASE_URL`) rather than a hardcoded snapshot. Returns one model id per line with the configured default model marked, e.g.:
+
+```text
+glm-4.5
+glm-4.6
+glm-5.2
+glm-5.3  <- current default
+```
+
+If the configured default model is not offered by the endpoint, a trailing `Configured default: <model> (not offered by this endpoint)` line notes it instead. The listing uses a short request timeout (15s) and returns an `Error: ...` message when no API key is configured or the provider cannot be reached.
 
 ## Codex / VS Code Notes
 

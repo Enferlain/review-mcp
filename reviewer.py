@@ -14,8 +14,6 @@ from review_mcp.config import (
     DEFAULT_MODEL_API_TIMEOUT_SECONDS,
     DEFAULT_READ_FILE_LINES,
     DEFAULT_REVIEW_MODEL,
-    GLM_5_2_CONTEXT_WINDOW_TOKENS,
-    GLM_5_2_MAX_OUTPUT_TOKENS,
     DEFAULT_SEARCH_RESULTS,
     DEFAULT_TREE_ENTRIES,
     EXCLUDE_PATTERNS,
@@ -32,6 +30,9 @@ from review_mcp.config import (
     _get_model_api_timeout_seconds,
     _get_optional_positive_int_env,
     _get_positive_int_env,
+    _get_reasoning_effort,
+    _get_review_model,
+    _supports_reasoning,
     logger,
 )
 from review_mcp.context import (
@@ -75,4 +76,8 @@ from review_mcp.review_tools import (
     _normalized_tool_call_key,
     _truncate_content,
 )
-from review_mcp.transport import _create_streaming_chat_completion, _make_client
+from review_mcp.transport import (
+    _create_streaming_chat_completion,
+    _list_available_models,
+    _make_client,
+)

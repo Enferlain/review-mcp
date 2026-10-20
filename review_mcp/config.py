@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 
 from dotenv import load_dotenv
@@ -35,8 +36,9 @@ EXCLUDE_PATTERNS = [
     "pnpm-lock.yaml",
 ]
 
-DEFAULT_REVIEW_MODEL = "glm-5.2"
+DEFAULT_REVIEW_MODEL = "glm-5.3-flash"
 DEFAULT_GLM_5_2_REASONING_EFFORT = "high"
+# Request-level effort values shared across the reasoning-capable GLM 4.5+ family.
 GLM_5_2_REASONING_EFFORTS = {
     "none",
     "minimal",
@@ -47,8 +49,7 @@ GLM_5_2_REASONING_EFFORTS = {
     "max",
 }
 DEFAULT_MODEL_API_TIMEOUT_SECONDS = 900.0
-GLM_5_2_CONTEXT_WINDOW_TOKENS = 1_000_000
-GLM_5_2_MAX_OUTPUT_TOKENS = 131_072
+LIST_MODELS_TIMEOUT_SECONDS = 15.0
 # Character counts are not model token counts. Keep this name as a compatibility
 # export for callers that imported it, but do not apply a model-derived default.
 # The provider's completion usage is the authoritative context measurement.
@@ -94,6 +95,47 @@ def _get_glm_5_2_reasoning_effort() -> str:
         )
         return DEFAULT_GLM_5_2_REASONING_EFFORT
     return value
+
+
+_GLM_MODEL_VERSION_RE = re.compile(r"^glm-(\d+)(?:\.(\d+))?", re.IGNORECASE)
+_MIN_REASONING_GLM_VERSION = (4, 5)
+
+
+def _supports_reasoning(model_id: str) -> bool:
+    """Return True when the model accepts reasoning-effort request controls."""
+    match = _GLM_MODEL_VERSION_RE.match(model_id.strip())
+    if match is None:
+        return False
+    major = int(match.group(1))
+    minor = int(match.group(2) or 0)
+    return (major, minor) >= _MIN_REASONING_GLM_VERSION
+
+
+def _get_reasoning_effort(override: str | None = None) -> str:
+    """Return the effective reasoning effort for reasoning-capable GLM models.
+
+    An explicit per-call override wins when provided; otherwise the
+    AI_REASONING_EFFORT / ZHIPU_REASONING_EFFORT environment settings apply.
+    An invalid explicit override raises ValueError so the caller is told to
+    pick a valid one; invalid environment values warn and fall back to the
+    default.
+    """
+    if override is not None and override.strip():
+        value = override.strip().lower()
+        if value not in GLM_5_2_REASONING_EFFORTS:
+            raise ValueError(
+                f"Invalid reasoning_effort {override!r}. "
+                "Pick one of: none, minimal, low, medium, high, xhigh, max."
+            )
+        return value
+    return _get_glm_5_2_reasoning_effort()
+
+
+def _get_review_model(override: str | None = None) -> str:
+    """Return the effective review model id: per-call override, then env, then default."""
+    if override:
+        return override
+    return os.getenv("AI_MODEL") or os.getenv("ZHIPU_MODEL") or DEFAULT_REVIEW_MODEL
 
 
 def _get_model_api_timeout_seconds() -> float:

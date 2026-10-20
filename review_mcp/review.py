@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 from collections.abc import Callable
@@ -12,13 +11,12 @@ from pathlib import Path
 from review_mcp import repository
 from review_mcp.config import (
     DEFAULT_MAX_TOOL_RESULT_CHARS,
-    DEFAULT_REVIEW_MODEL,
-    GLM_5_2_CONTEXT_WINDOW_TOKENS,
-    GLM_5_2_MAX_OUTPUT_TOKENS,
     _env_flag,
-    _get_glm_5_2_reasoning_effort,
     _get_optional_positive_int_env,
     _get_positive_int_env,
+    _get_reasoning_effort,
+    _get_review_model,
+    _supports_reasoning,
     logger,
 )
 from review_mcp.context import expand_context_entry, read_context_file_with_links
@@ -33,7 +31,6 @@ from review_mcp.review_tools import (
     _truncate_content,
 )
 from review_mcp.transport import _create_streaming_chat_completion, _make_client
-
 
 ReviewStatusCallback = Callable[[str], None]
 
@@ -111,6 +108,8 @@ def run_agentic_review(
     task_description: str = "",
     include_trace: bool | None = None,
     status_callback: ReviewStatusCallback | None = None,
+    model: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> str:
     """
     Run an agentic review where GLM decides what information to gather.
@@ -351,21 +350,17 @@ Be concise but thorough. Ignore minor style issues."""
         {"role": "user", "content": user_message},
     ]
 
-    model_name = (
-        os.getenv("AI_MODEL") or os.getenv("ZHIPU_MODEL") or DEFAULT_REVIEW_MODEL
-    )
-    model_context_window_tokens = (
-        GLM_5_2_CONTEXT_WINDOW_TOKENS
-        if model_name.strip().lower() == "glm-5.2"
-        else None
-    )
-    glm_5_2_reasoning_effort = (
-        _get_glm_5_2_reasoning_effort()
-        if model_name.strip().lower() == "glm-5.2"
-        else None
-    )
-    if glm_5_2_reasoning_effort:
-        trace.append(f"Reasoning effort: {glm_5_2_reasoning_effort}")
+    model_name = _get_review_model(model)
+    try:
+        glm_reasoning_effort = (
+            _get_reasoning_effort(reasoning_effort)
+            if _supports_reasoning(model_name)
+            else None
+        )
+    except ValueError as exc:
+        return _append_review_trace(f"Error: {exc}", trace, trace_enabled)
+    if glm_reasoning_effort:
+        trace.append(f"Reasoning effort: {glm_reasoning_effort}")
     logger.info("Starting review...")
     logger.info("Found %s changed files", len(changed_files))
     logger.info("Loaded %s context file paths", len(loaded_context_files))
@@ -390,9 +385,10 @@ Be concise but thorough. Ignore minor style issues."""
     previous_prompt_tokens: int | None = None
     model_call_count = 0
     truncated_tool_call_retry_sent = False
-    # Tool use is bounded by the model context window, not an arbitrary number
-    # of calls. Once provider-reported usage consumes the available input
-    # budget, make one tool-free call so the model can synthesize its findings.
+    # Tool use is bounded by the optional character safety ceiling and per-tool
+    # result limits, not an arbitrary number of calls; the provider enforces
+    # its own model context window. When the local budget is exhausted, make
+    # one tool-free call so the model can synthesize its findings.
     while True:
         model_call_count += 1
         final_response_required = force_final_response
@@ -420,16 +416,14 @@ Be concise but thorough. Ignore minor style issues."""
                     "messages": messages,
                     "temperature": 0.2,
                 }
-                if model_context_window_tokens is not None:
-                    completion_kwargs["max_tokens"] = GLM_5_2_MAX_OUTPUT_TOKENS
-                if glm_5_2_reasoning_effort:
+                if glm_reasoning_effort:
                     thinking_type = (
                         "disabled"
-                        if glm_5_2_reasoning_effort == "none"
+                        if glm_reasoning_effort == "none"
                         else "enabled"
                     )
                     completion_kwargs.update(
-                        reasoning_effort=glm_5_2_reasoning_effort,
+                        reasoning_effort=glm_reasoning_effort,
                         extra_body={
                             "thinking": {
                                 "type": thinking_type,
@@ -490,20 +484,6 @@ Be concise but thorough. Ignore minor style issues."""
             if isinstance(completion_tokens, int):
                 usage_trace += f", {completion_tokens} completion tokens"
             trace.append(usage_trace)
-            if model_context_window_tokens is not None:
-                remaining_input_tokens = (
-                    model_context_window_tokens
-                    - prompt_tokens
-                    - GLM_5_2_MAX_OUTPUT_TOKENS
-                )
-                trace.append(
-                    f"{phase_label}: {max(0, remaining_input_tokens)} input tokens remain after reserving the model output allowance"
-                )
-                if remaining_input_tokens <= 0 and not final_response_required:
-                    force_final_response = True
-                    trace.append(
-                        "Model token budget reached; requesting final synthesis on the next call"
-                    )
         content = _message_content_to_text(message.content)
         if finish_reason == "length":
             trace.append(
@@ -644,7 +624,7 @@ Be concise but thorough. Ignore minor style issues."""
                 result = "This exact tool request was already completed. Use the previous result or request a narrower, different range."
                 trace.append(f"Tool call deduplicated: {func_name}")
             elif force_final_response:
-                result = "The model context budget has been reached. Produce the final review from the information already gathered."
+                result = "The review context budget has been reached. Produce the final review from the information already gathered."
             else:
                 seen_tool_calls.add(tool_key)
                 try:
