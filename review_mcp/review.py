@@ -116,6 +116,8 @@ def run_agentic_review(
     Run an agentic review where GLM decides what information to gather.
 
     Returns string-compatible review text with an ``ok`` outcome attribute.
+    ``include_trace`` appends diagnostics and overrides REVIEW_MCP_INCLUDE_TRACE
+    (default false).
     """
     trace_enabled = (
         _env_flag("REVIEW_MCP_INCLUDE_TRACE")

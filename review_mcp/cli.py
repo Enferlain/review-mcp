@@ -280,13 +280,13 @@ def run_main(argv: list[str] | None = None) -> int:
         "--reasoning-effort",
         default=None,
         choices=["none", "minimal", "low", "medium", "high", "xhigh", "max"],
-        help="Reasoning effort for reasoning-capable GLM models (default: high)",
+        help="Reasoning effort for reasoning-capable GLM models (default: max)",
     )
     parser.add_argument(
         "--trace",
         action="store_true",
         default=None,
-        help="Include the diagnostic trace in the review",
+        help="Include the diagnostic trace in the returned and saved review",
     )
     parser.add_argument(
         "--timeout",
@@ -486,7 +486,7 @@ def run_main(argv: list[str] | None = None) -> int:
             ok=ok,
             chars=len(result),
         )
-        print(result)
+        print(artifacts.format_response(result))
         return 0 if ok and saved else 1
 
 

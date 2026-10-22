@@ -70,6 +70,10 @@ class ReviewArtifacts:
                 )
             self._write_status()
 
+    def format_response(self, result: str) -> str:
+        """Return review text with a single pointer to the saved diagnostics."""
+        return f"{result}\n\nReview artifacts: {self.directory}"
+
     def finish(self, state: str, *, exit_code: int, message: str) -> None:
         with self._lock:
             self._status.update(

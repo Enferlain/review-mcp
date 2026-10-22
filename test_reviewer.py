@@ -980,7 +980,7 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
             "custom-review-model",
         )
 
-    def test_glm_5_2_uses_high_preserved_reasoning_by_default(self) -> None:
+    def test_glm_5_2_uses_max_preserved_reasoning_by_default(self) -> None:
         fake_client = mock.Mock()
         fake_client.chat.completions.create.return_value = _model_response(
             SimpleNamespace(content="review", tool_calls=None)
@@ -994,7 +994,7 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
                 reviewer.run_agentic_review(working_dir=tmpdir)
 
         call_kwargs = fake_client.chat.completions.create.call_args.kwargs
-        self.assertEqual(call_kwargs["reasoning_effort"], "high")
+        self.assertEqual(call_kwargs["reasoning_effort"], "max")
         self.assertEqual(
             call_kwargs["extra_body"],
             {
@@ -1069,13 +1069,13 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
         self.assertEqual(call_kwargs["reasoning_effort"], "none")
         self.assertEqual(call_kwargs["extra_body"]["thinking"]["type"], "disabled")
 
-    def test_invalid_glm_5_2_reasoning_effort_defaults_to_high(self) -> None:
+    def test_invalid_glm_5_2_reasoning_effort_defaults_to_max(self) -> None:
         with mock.patch.dict(
             os.environ,
             {"AI_REASONING_EFFORT": "invalid"},
             clear=True,
         ):
-            self.assertEqual(reviewer._get_glm_5_2_reasoning_effort(), "high")
+            self.assertEqual(reviewer._get_glm_5_2_reasoning_effort(), "max")
 
     def test_api_error_mentions_selected_model(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1181,7 +1181,7 @@ class RunAgenticReviewEnvTests(unittest.TestCase):
                 reviewer.run_agentic_review(working_dir=tmpdir)
 
         call_kwargs = fake_client.chat.completions.create.call_args.kwargs
-        self.assertEqual(call_kwargs["reasoning_effort"], "high")
+        self.assertEqual(call_kwargs["reasoning_effort"], "max")
         self.assertEqual(
             call_kwargs["extra_body"],
             {

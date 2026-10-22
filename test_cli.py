@@ -73,7 +73,7 @@ def test_run_emits_ndjson_progress_and_review(capsys, fake_review):
     code = cli.run_main(["--progress", "ndjson", "--heartbeat", "0"])
     assert code == 0
     captured = capsys.readouterr()
-    assert captured.out == "## Review\nLooks good.\n"
+    assert captured.out.startswith("## Review\nLooks good.\n\nReview artifacts: ")
 
     records = [json.loads(line) for line in captured.err.splitlines() if line.strip()]
     statuses = [r for r in records if r["type"] == "status"]
@@ -253,6 +253,8 @@ def test_real_review_failures_have_unsuccessful_outcomes(
     captured = capsys.readouterr()
     assert code == 1
     assert _parse_records(captured.err)[-1]["ok"] is False
+    assert ("## Review Trace" in captured.out) is trace
+    assert "Review artifacts:" in captured.out
     assert (
         "Error calling model" if failure == "provider" else "No review generated."
     ) in captured.out
@@ -393,13 +395,20 @@ def test_cli_restores_logging_configuration(fake_review, capsys):
     capsys.readouterr()
 
 
-def test_real_review_outcome_serializes_as_mcp_text(monkeypatch, tmp_path):
+@pytest.mark.parametrize("trace_env", ["false", "true"])
+@pytest.mark.parametrize("include_trace", [None, False, True])
+def test_real_review_outcome_serializes_as_mcp_text(
+    monkeypatch, tmp_path, artifact_runs, include_trace, trace_env
+):
     import anyio
     from mcp import Client
     from types import SimpleNamespace
     from server import create_mcp
     import review_mcp.review as review
 
+    monkeypatch.delenv("AI_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("ZHIPU_REASONING_EFFORT", raising=False)
+    monkeypatch.setenv("REVIEW_MCP_INCLUDE_TRACE", trace_env)
     monkeypatch.setattr(review, "_make_client", lambda: object())
     monkeypatch.setattr(
         review,
@@ -417,10 +426,74 @@ def test_real_review_outcome_serializes_as_mcp_text(monkeypatch, tmp_path):
 
     async def call():
         async with Client(create_mcp(str(tmp_path))) as client:
-            result = await client.call_tool("review_with_context", {})
-            assert result.structured_content["result"] == "review text"
+            result = await client.call_tool(
+                "review_with_context",
+                {"model": "glm-5.3", "include_trace": include_trace},
+            )
+            run = artifact_runs[0]
+            text = result.structured_content["result"]
+            saved = run.result_path.read_text().removesuffix("\n")
+            assert text == f"{saved}\n\nReview artifacts: {run.directory}"
+            assert saved.startswith("review text")
+            enabled = trace_env == "true" if include_trace is None else include_trace
+            assert ("## Review Trace" in text) is enabled
+            assert not (run.directory / "trace.md").exists()
+            if enabled:
+                assert "Reasoning effort: max" in saved
 
     anyio.run(call)
+
+
+@pytest.mark.parametrize("trace", [False, True])
+def test_cli_opt_in_trace_is_returned_and_saved(
+    monkeypatch, tmp_path, artifact_runs, capsys, trace
+):
+    from types import SimpleNamespace
+    from unittest import mock
+    import review_mcp.review as review
+
+    monkeypatch.delenv("AI_REASONING_EFFORT", raising=False)
+    monkeypatch.delenv("ZHIPU_REASONING_EFFORT", raising=False)
+    monkeypatch.setenv("REVIEW_MCP_INCLUDE_TRACE", "false")
+    monkeypatch.setattr(review, "_make_client", lambda: object())
+    complete = mock.Mock(
+        return_value=SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="Completed review", tool_calls=None
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(prompt_tokens=123, completion_tokens=45),
+        )
+    )
+    monkeypatch.setattr(review, "_create_streaming_chat_completion", complete)
+    code = cli.run_main(
+        [
+            str(tmp_path),
+            "--model",
+            "glm-5.3-flash",
+            "--heartbeat",
+            "0",
+            "--progress",
+            "none",
+            *(["--trace"] if trace else []),
+        ]
+    )
+    assert code == 0
+    captured = capsys.readouterr()
+    run = artifact_runs[0]
+    saved = run.result_path.read_text().removesuffix("\n")
+    assert captured.out == f"{saved}\n\nReview artifacts: {run.directory}\n"
+    assert saved.startswith("Completed review")
+    assert captured.err == ""
+    assert complete.call_args.kwargs["reasoning_effort"] == "max"
+    assert ("## Review Trace" in saved) is trace
+    assert not (run.directory / "trace.md").exists()
+    if trace:
+        assert "123 prompt tokens" in saved
 
 
 @pytest.mark.parametrize("style", ["ndjson", "plain", "none"])
@@ -564,7 +637,7 @@ def test_default_progress_is_plain_and_suppresses_routine_logs(monkeypatch, caps
     monkeypatch.setattr("review_mcp.review.run_agentic_review", review)
     assert cli.run_main(["--heartbeat", "0"]) == 0
     captured = capsys.readouterr()
-    assert captured.out == "review text\n"
+    assert captured.out.startswith("review text\n\nReview artifacts: ")
     assert "Read server.py, lines 120–180" in captured.err
     assert "Payload size" not in captured.err
     assert not any(line.startswith("{") for line in captured.err.splitlines())

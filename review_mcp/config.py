@@ -37,7 +37,7 @@ EXCLUDE_PATTERNS = [
 ]
 
 DEFAULT_REVIEW_MODEL = "glm-5.3-flash"
-DEFAULT_GLM_5_2_REASONING_EFFORT = "high"
+DEFAULT_GLM_5_2_REASONING_EFFORT = "max"
 # Request-level effort values shared across the reasoning-capable GLM 4.5+ family.
 GLM_5_2_REASONING_EFFORTS = {
     "none",

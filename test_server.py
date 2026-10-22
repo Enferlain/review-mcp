@@ -136,7 +136,7 @@ class ServerWorkspaceTests(unittest.TestCase):
         async def call():
             async with Client(server.create_mcp(".")) as client:
                 result = await client.call_tool("review_with_context", {})
-                self.assertEqual(result.structured_content["result"], "Recoverable MCP review")
+                self.assertEqual(result.structured_content["result"], self.artifact_runs[0].format_response("Recoverable MCP review"))
                 self.assertEqual(self.artifact_runs[0].result_path.read_text(), "Recoverable MCP review\n")
 
         with mock.patch("reviewer.run_agentic_review", side_effect=review):
@@ -419,7 +419,7 @@ class ServerWorkspaceTests(unittest.TestCase):
         with mock.patch("reviewer.run_agentic_review", return_value="synthetic final review"):
             result = anyio.run(run_tool_flow)
 
-        self.assertEqual(result, "synthetic final review")
+        self.assertEqual(result, self.artifact_runs[0].format_response("synthetic final review"))
 
     def test_review_with_context_threads_model_and_reasoning_effort(self) -> None:
         async def run_tool_flow() -> dict:

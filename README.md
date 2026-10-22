@@ -72,13 +72,13 @@ Environment variables (in `.env`):
 - `GLM_API_KEY` (optional): Alternate fallback key name
 - `ZHIPU_BASE_URL` (optional): Override API endpoint
 - `AI_MODEL` / `ZHIPU_MODEL` (optional): Override the review model (default: `glm-5.3-flash`); can also be set per call via the `model` parameter — use the `list_models` tool to see what the endpoint offers
-- `AI_REASONING_EFFORT` / `ZHIPU_REASONING_EFFORT` (optional): Reasoning effort (default: `high`), sent for GLM models with reasoning controls (the `glm-4.5`+ family); also settable per call via the `reasoning_effort` parameter, where `none` disables thinking. Note: these request parameters are now sent for the whole `glm-4.5`+ family, not just `glm-5.2`.
+- `AI_REASONING_EFFORT` / `ZHIPU_REASONING_EFFORT` (optional): Reasoning effort (default: `max`), sent for GLM models with reasoning controls (the `glm-4.5`+ family); also settable per call via the `reasoning_effort` parameter, where `none` disables thinking. Note: these request parameters are now sent for the whole `glm-4.5`+ family, not just `glm-5.2`.
 - `AI_API_TIMEOUT_SECONDS` (optional): Timeout for each model API request (default: 900)
 - `MAX_REVIEW_CONTEXT_CHARS` (optional): Explicit character-based safety ceiling for the accumulated request. Unset by default; character counts are not used as a proxy for model tokens. The completion API's `usage.prompt_tokens` is the authoritative context measurement, and the provider enforces its own model window.
 - `MAX_REVIEW_TOOL_RESULT_CHARS` (optional): Per-tool result ceiling before truncation (default: 20000)
 - `MAX_REVIEW_MODEL_CALLS` (optional): Review-turn budget (default: 64; invalid values or values below 2 fall back to 64), including one reserved tool-free final synthesis call. Transient failures can cause up to three HTTP attempts per turn. This bounds long tool loops independently of the selected model's context window. Provider context-limit errors still end the review with a failure; this budget does not estimate tokens.
 - `REVIEW_TOOL_TIMEOUT_SECONDS` (optional): End the MCP tool call before the host-level timeout (default: 1800)
-- `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to review responses (`true`/`false`)
+- `REVIEW_MCP_INCLUDE_TRACE` (optional): Append diagnostic trace details to returned and saved reviews (`true`/`false`, default: false).
 
 ## Usage
 
@@ -93,9 +93,9 @@ Parameters:
 - `focus_files`: Specific files to focus the review on
 - `task_description`: Description of what you're trying to accomplish
 - `working_directory`: Git repository root to review (required unless the server was started with `--workspace-dir`)
-- `include_trace`: Include a compact diagnostic trace in the returned review (optional, defaults to `REVIEW_MCP_INCLUDE_TRACE`)
+- `include_trace`: Append a diagnostic trace to the returned and saved review when true (optional; defaults to `REVIEW_MCP_INCLUDE_TRACE`, then false). An explicit false disables tracing even when the environment enables it.
 - `model`: Model id for this review, e.g. `glm-5.3` (optional; defaults to `AI_MODEL`/`ZHIPU_MODEL`, then `glm-5.3-flash`)
-- `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (optional; defaults to `AI_REASONING_EFFORT`/`ZHIPU_REASONING_EFFORT`, then `high`; only sent for reasoning-capable GLM models, `none` disables thinking; invalid values return an error listing the options)
+- `reasoning_effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max` (optional; defaults to `AI_REASONING_EFFORT`/`ZHIPU_REASONING_EFFORT`, then `max`; only sent for reasoning-capable GLM models, `none` disables thinking; invalid values return an error listing the options)
 
 Progress pairs ongoing and finished work: `Reading …` / `Read …`, `Searching …` / `Searched …`, and `Inspecting …` / `Inspected …`. Searches include their result counts. Each review turn reports the messages sent, then the provider-reported input and output token counts when available. These are per-turn counts; the input includes conversation history. Retries, shortened results, and finalization are also reported.
 
@@ -122,7 +122,7 @@ OpenSpec change folders are included only when the MCP caller passes the folder 
 }
 ```
 
-If MCP calls feel opaque, set `include_trace` to `true` for a single call or set `REVIEW_MCP_INCLUDE_TRACE=true` in the environment. The returned review will include a compact trace with the workspace, diff target, context-file count, review turns, provider-reported token usage, and tool calls.
+CLI and MCP responses contain the review followed by `Review artifacts: <directory>`. Diagnostic traces are appended to the review only when enabled with `include_trace=true`, `--trace`, or `REVIEW_MCP_INCLUDE_TRACE=true`. Tracing is off by default. The saved `review.md` includes the trace when enabled; no separate trace file is created.
 
 Trace output is meant for debugging review behavior and can be disabled again once the setup is behaving as expected.
 
@@ -146,13 +146,13 @@ Some MCP clients (Codex CLI at the time of writing) neither request MCP progress
 ```bash
 uvx --from git+https://github.com/Enferlain/review-mcp.git@main review-mcp run <workspace> \
   [--diff-target staged] [--context PATH ...] [--focus PATH ...] [--task TEXT] \
-  [--model ID] [--reasoning-effort high] [--trace] [--timeout 1800] \
+  [--model ID] [--reasoning-effort max] [--trace] [--timeout 1800] \
   [--heartbeat 120] [--progress plain|ndjson|none]
 ```
 
 - The review text is printed to **stdout** (the invoking agent captures it as command output); exit code 0 on success, 1 on a failed/timed-out review, 130 on Ctrl-C.
 - Progress goes to **stderr** as concise `[  12.3s] action` lines by default. `--progress ndjson` emits JSON records for automation (`schema_version`, `type` = `status` | `heartbeat` | `result`, `ts`, `elapsed`, `message`; result records add `ok` and `chars`). Consumers should ignore unknown keys and types. Heartbeats default to 120 seconds of silence; `--heartbeat 0` disables them. `--progress none` silences stderr.
-  `chars` counts the review text, excluding the newline added when printing it.
+  `chars` counts the saved review text, excluding the artifacts path footer and the newline added when printing it.
 - `review-mcp models` prints the same live model listing as the `list_models` tool.
 
 Every review started through the CLI or MCP tool automatically keeps a private
@@ -162,6 +162,7 @@ in CLI NDJSON records). The directory contains:
 
 - `review.md`: the completed review or error response, atomically saved before
   stdout is written, so losing the terminal connection cannot lose a saved result.
+  The artifacts path footer is added to the returned response, not to this file.
 - `progress.ndjson`: progress records written as they happen, even when terminal
   progress is disabled with `--progress none`.
 - `status.json`: request options, process ID, outcome, and whether a result exists.
@@ -179,7 +180,7 @@ Example progress (one review, with repository tools between analysis turns):
 
 ```text
 [    0.0s] Preparing review of HEAD^.
-[    0.1s] Review turn 1: sending 2 messages to glm-5.3 (effort: high).
+[    0.1s] Review turn 1: sending 2 messages to glm-5.3 (effort: max).
 [    4.0s] Review turn 1: received response; 1,234 input tokens, 120 output tokens.
 [    4.0s] Reading server.py, lines 120–180
 [    4.1s] Read server.py, lines 120–180

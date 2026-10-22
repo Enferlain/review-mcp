@@ -147,13 +147,14 @@ def create_mcp(workspace_dir: str | None = None) -> MCPServer:
             focus_files: Specific files to focus the review on
             task_description: Optional task description for reviewer intent
             working_directory: Git repository root to review. Required unless the server was started with --workspace-dir
-            include_trace: Include a compact diagnostic trace in the returned review
+            include_trace: Append a diagnostic trace to the returned and saved review.
+                Defaults to REVIEW_MCP_INCLUDE_TRACE (false).
             model: Optional model id for this review (e.g. 'glm-5.3'); defaults to
                 AI_MODEL/ZHIPU_MODEL (glm-5.3-flash). Use list_models to discover
                 available ids.
             reasoning_effort: Optional reasoning effort for reasoning-capable GLM models
                 ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'); defaults to
-                AI_REASONING_EFFORT/ZHIPU_REASONING_EFFORT ('high'). 'none' disables
+                AI_REASONING_EFFORT/ZHIPU_REASONING_EFFORT ('max'). 'none' disables
                 thinking. Invalid values return an error listing the options.
 
         Returns:
@@ -306,7 +307,7 @@ def create_mcp(workspace_dir: str | None = None) -> MCPServer:
             finish_artifacts("timed_out", exit_code=1, message=result)
         if persistence_errors and "Error: Could not save all review files:" not in result:
             result = persistence_failure(result)
-        return result
+        return artifacts.format_response(result)
 
     @mcp.tool()
     async def list_models() -> str:
